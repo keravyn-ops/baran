@@ -751,6 +751,30 @@ def format_command(argv: list[str], env: dict[str, str]) -> str:
 # --- Launching -------------------------------------------------------------
 
 
+def running_pid(game: dict) -> int | None:
+    """PID of a launch of this game that is still alive."""
+    pidfile = STATE_DIR / f"running-{game['id']}.pid"
+    try:
+        pid = int(pidfile.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError):
+        pidfile.unlink(missing_ok=True)
+        return None
+    return pid
+
+
+def mark_running(game: dict, pid: int) -> None:
+    ensure_dirs()
+    (STATE_DIR / f"running-{game['id']}.pid").write_text(str(pid), encoding="utf-8")
+
+
+def clear_running(game: dict) -> None:
+    (STATE_DIR / f"running-{game['id']}.pid").unlink(missing_ok=True)
+
+
 def launch_game(game: dict, settings: dict, detach: bool = False,
                 print_only: bool = False, assume_yes: bool = False,
                 keep_module: bool = False) -> int:
@@ -759,6 +783,14 @@ def launch_game(game: dict, settings: dict, detach: bool = False,
     if print_only:
         print(format_command(argv, extra_env))
         return 0
+
+    # One launch per game: parallel starts fight over the same Wine prefix and
+    # can corrupt it.
+    existing = running_pid(game)
+    if existing is not None:
+        err(f"{game['name']} is already starting or running (PID {existing}).")
+        err("Wait for it, or close it before launching again.")
+        return 1
 
     loaded_by_us = False
     if runtime == "linuwux":
@@ -798,25 +830,32 @@ def launch_game(game: dict, settings: dict, detach: bool = False,
                 if detach:
                     proc = subprocess.Popen(argv, cwd=workdir, env=env, stdout=log,
                                             stderr=subprocess.STDOUT, start_new_session=True)
+                    mark_running(game, proc.pid)
                     ok(f"{game['name']} started")
                     if loaded_by_us and not keep_module:
-                        # Wait in the background so KVM comes back by itself.
+                        # Someone has to outlive the game to restore KVM. The pid
+                        # file alone cannot do that, so stay around and wait.
                         import threading
 
-                        def restore():
+                        def watch():
                             proc.wait()
+                            clear_running(game)
                             unprepare_cpuid(force=True)
 
-                        threading.Thread(target=restore, daemon=False).start()
-                        info("KVM returns automatically once the game exits")
+                        threading.Thread(target=watch, daemon=False).start()
+                        info("Staying in the background to restore KVM when the game exits")
                     return 0
-                rc = subprocess.run(argv, cwd=workdir, env=env).returncode
+                proc = subprocess.Popen(argv, cwd=workdir, env=env)
+                mark_running(game, proc.pid)
+                rc = proc.wait()
             except FileNotFoundError:
                 err(f"Cannot execute: {argv[0]}")
                 rc = 127
             except KeyboardInterrupt:
                 rc = 130
     finally:
+        if not detach:
+            clear_running(game)
         if loaded_by_us and not detach:
             if keep_module:
                 info("Keeping the CPUID module loaded (--keep)")
