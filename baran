@@ -984,13 +984,15 @@ def doctor_report(settings: dict | None = None) -> tuple[list[tuple[str, str, st
     rows.append(("ok", "System", f"{os.uname().sysname} {kernel_release()} ({os.uname().machine})"))
 
     protons = list_protons()
+    umu = which("umu-run")
     if protons:
         best = pick_proton(settings.get("default_proton", ""))
         rows.append(("ok", "Proton", f"{len(protons)} found, preferred: {best.parent.name if best else '?'}"))
+    elif umu:
+        rows.append(("ok", "Proton", "none installed; umu-run will fetch one on first launch"))
     else:
         rows.append(("err", "Proton", "none found; install Proton (Steam/GE) or umu-run"))
 
-    umu = which("umu-run")
     rows.append(("ok" if umu else "warn", "umu-run", umu or "not installed (optional)"))
 
     # Legion
