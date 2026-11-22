@@ -706,8 +706,11 @@ def build_command(game: dict, settings: dict) -> tuple[list[str], dict[str, str]
     if runtime == "legion":
         usable, detail = legion_usable(settings)
         if not usable:
-            warn(f"Legion unusable ({detail}); falling back to Proton")
-            runtime = "proton"
+            # Never silently downgrade: a game that needs a runtime must not
+            # start without it and pretend everything is fine.
+            die(f"Runtime 'legion' is not available: {detail}\n"
+                f"    Build it with 'baran build-legion', or switch this game to "
+                f"another runtime with 'baran run {game['id']} --runtime proton'.")
         else:
             mem = int(settings.get("legion_memory_mib") or 0)
             if mem <= 0:
@@ -793,11 +796,19 @@ def launch_game(game: dict, settings: dict, detach: bool = False,
                 pass
             try:
                 if detach:
-                    subprocess.Popen(argv, cwd=workdir, env=env, stdout=log,
-                                     stderr=subprocess.STDOUT, start_new_session=True)
+                    proc = subprocess.Popen(argv, cwd=workdir, env=env, stdout=log,
+                                            stderr=subprocess.STDOUT, start_new_session=True)
                     ok(f"{game['name']} started")
                     if loaded_by_us and not keep_module:
-                        warn("CPUID module stays loaded; run 'baran unprepare' when done.")
+                        # Wait in the background so KVM comes back by itself.
+                        import threading
+
+                        def restore():
+                            proc.wait()
+                            unprepare_cpuid(force=True)
+
+                        threading.Thread(target=restore, daemon=False).start()
+                        info("KVM returns automatically once the game exits")
                     return 0
                 rc = subprocess.run(argv, cwd=workdir, env=env).returncode
             except FileNotFoundError:
@@ -913,6 +924,31 @@ def extract_icon(exe: Path, game_id: str) -> str:
 
 # --- Adding and scanning ---------------------------------------------------
 
+HV_MARKERS = ("steam_settings", "artifact.dll", "steam_appid.txt",
+              "hypervisor.dll", "steamclient_loader.exe")
+
+
+def detect_hv_build(exe: Path) -> dict | None:
+    """Spot a hypervisor/ARTIFACT style build next to the executable.
+
+    Those need the LinUwUx preload and CPUID faulting, so Baran should pick
+    that runtime itself instead of letting the user find out the hard way.
+    """
+    folder = exe.parent
+    found = [m for m in HV_MARKERS if (folder / m).exists()]
+    if not found:
+        return None
+    appid = ""
+    for candidate in (folder / "steam_settings/steam_appid.txt", folder / "steam_appid.txt"):
+        if candidate.is_file():
+            try:
+                appid = candidate.read_text(encoding="utf-8", errors="replace").strip()
+                break
+            except OSError:
+                pass
+    return {"markers": found, "appid": appid}
+
+
 SKIP_EXE = re.compile(
     r"(unins|uninstall|setup|install|crashhandler|crashreport|vcredist|dxsetup|"
     r"directx|dotnet|launcher_helper|redist|benchmark|config\.exe|touchup|"
@@ -940,10 +976,19 @@ def add_game(exe: Path, name: str = "", runtime: str = "auto",
             warn(f"Already present: {g['name']} ({g['id']})")
             return g
 
+    hv = detect_hv_build(exe)
+    if hv and runtime == "auto":
+        runtime = "linuwux"
+        info(f"Hypervisor/ARTIFACT build detected ({', '.join(hv['markers'])})")
+        info("Runtime set to linuwux; it needs LinUwUx and CPUID faulting")
+
     game = make_game(exe, name=name, runtime=runtime, args=args, games=games,
                      prefix=prefix, proton=proton)
     if env:
         game["env"] = env
+    if hv and hv.get("appid") and "STEAM_APPID" not in game["env"]:
+        game["env"]["STEAM_APPID"] = hv["appid"]
+        info(f"Using STEAM_APPID={hv['appid']} from the build")
     if prefix:
         recorded = proton_from_prefix(Path(prefix).expanduser())
         if recorded:
@@ -1356,14 +1401,18 @@ def setup_plan(target: str, settings: dict | None = None) -> list[dict]:
     }]
 
     if target == "linuwux":
-        steps += [
+        steps.append(
             {"key": "umip", "title": "UMIP disabled",
              "why": "LinUwUx cannot work while UMIP is on. Needs a bootloader change "
                     "and a reboot, so Baran shows you what to add instead of editing it.",
-             "check": check_umip, "fix": ["umip"], "manual": True, "reboot": True},
-            {"key": "tools", "title": "Build tools",
-             "why": "git, Rust and a C compiler are needed to build LinUwUx.",
-             "check": check_build_tools, "fix": ["install-deps"]},
+             "check": check_umip, "fix": ["umip"], "manual": True, "reboot": True})
+        # Build tools are only a prerequisite while something still needs building.
+        if not check_linuwux()[0] or not check_cpuid()[0]:
+            steps.append(
+                {"key": "tools", "title": "Build tools",
+                 "why": "git, Rust and a C compiler are needed to build the pieces below.",
+                 "check": check_build_tools, "fix": ["install-deps"]})
+        steps += [
             {"key": "linuwux", "title": "LinUwUx built",
              "why": "The preload library that fakes the CPU profile.",
              "check": check_linuwux, "fix": ["build-linuwux"]},
@@ -1698,7 +1747,6 @@ def run_gtk_gui() -> bool:
             toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
             for label, handler in (("Play", self.on_play),
                                    ("Edit", self.on_edit),
-                                   ("Runtime", self.on_runtime),
                                    ("Desktop entry", self.on_shortcut),
                                    ("Remove", self.on_remove)):
                 btn = Gtk.Button(label=label)
@@ -1766,21 +1814,6 @@ def run_gtk_gui() -> bool:
             game = self.selected()
             if game:
                 self.launch(game)
-
-        def on_runtime(self, _b):
-            game = self.selected()
-            if not game:
-                return
-            order = list(RUNTIMES)
-            current = game.get("runtime", "auto")
-            nxt = order[(order.index(current) + 1) % len(order)] if current in order else "auto"
-            games = load_games()
-            for g in games:
-                if g["id"] == game["id"]:
-                    g["runtime"] = nxt
-            save_games(games)
-            self.reload()
-            self.status.set_text(f"{game['name']}: runtime = {nxt}")
 
         def on_shortcut(self, _b):
             game = self.selected()
@@ -2003,8 +2036,16 @@ def run_gtk_gui() -> bool:
                 ("env", "Extra env (KEY=VALUE, space separated)",
                  " ".join(f"{k}={v}" for k, v in (game.get("env") or {}).items())),
             ]
+            settings = load_settings()
+            availability = {
+                "auto": True,
+                "proton": True,
+                "legion": legion_usable(settings)[0],
+                "linuwux": linuwux_usable(settings)[0],
+            }
             runtime_values = list(RUNTIMES)
-            dropdown = Gtk.DropDown.new_from_strings(runtime_values)
+            labels = [r if availability[r] else f"{r} (not set up)" for r in runtime_values]
+            dropdown = Gtk.DropDown.new_from_strings(labels)
             current = game.get("runtime", "auto")
             dropdown.set_selected(runtime_values.index(current)
                                   if current in runtime_values else 0)
