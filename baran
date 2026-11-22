@@ -1,0 +1,1858 @@
+#!/usr/bin/env python3
+"""Baran - run Windows games on Linux. Double-click and go.
+
+Baran keeps a list of your games, creates desktop entries for them and starts
+them through one of three runtimes:
+
+  proton   plain Proton/umu, the normal way
+  legion   inside a KVM virtual machine (Legion), KVM stays available
+  linuwux  with the LinUwUx preload and CPUID fault emulation, for titles
+           whose anti-tamper code needs it
+
+Proton, prefixes and runtimes are detected automatically; no setup required.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import unicodedata
+from datetime import datetime
+from pathlib import Path
+
+VERSION = "2.0.0"
+APP = "baran"
+APP_NAME = "Baran"
+RUNTIMES = ("auto", "proton", "legion", "linuwux")
+
+# --- Locations -------------------------------------------------------------
+
+
+def _xdg(var: str, default: str) -> Path:
+    return Path(os.environ.get(var) or Path.home() / default)
+
+
+CONFIG_DIR = Path(os.environ.get("BARAN_CONFIG_DIR") or _xdg("XDG_CONFIG_HOME", ".config") / APP)
+DATA_DIR = Path(os.environ.get("BARAN_DATA_DIR") or _xdg("XDG_DATA_HOME", ".local/share") / APP)
+STATE_DIR = Path(os.environ.get("BARAN_STATE_DIR") or _xdg("XDG_STATE_HOME", ".local/state") / APP)
+
+GAMES_FILE = CONFIG_DIR / "games.json"
+SETTINGS_FILE = CONFIG_DIR / "settings.json"
+PREFIX_DIR = DATA_DIR / "prefixes"
+ICON_DIR = DATA_DIR / "icons"
+LOG_DIR = STATE_DIR / "logs"
+STATE_FILE = STATE_DIR / "cpuid.state"
+APPLICATIONS_DIR = _xdg("XDG_DATA_HOME", ".local/share") / "applications"
+
+SELF = Path(__file__).resolve()
+
+MODULE_NAME = "cpuid_fault_emulation"
+SERVICE_NAME = "cpuid-fault-emulation.service"
+LINUWUX_REPO = "https://github.com/brcly/linuwux-runtime.git"
+MODULE_REPO = "https://github.com/dnmodder/cpuid-fault-emulation.git"
+LEGION_REPO = "https://github.com/brcly/legion-kvm.git"
+
+DEFAULT_SETTINGS = {
+    "default_runtime": "auto",   # auto | proton | legion | linuwux
+    "default_proton": "",        # empty = detect
+    "use_umu": True,             # prefer umu-run when available
+    # legion
+    "legion_path": "",
+    "legion_memory_mib": 0,      # 0 = derive from host RAM
+    "legion_fullscreen": False,
+    # linuwux
+    "linuwux_lib": "",           # empty = ~/.local/share/linuwux/LinUwUx.so
+    "linuwux_ref": "pr58",       # branch, tag, commit or prNN
+    "module_ko": "",             # empty = detect
+    "use_service": True,         # prefer systemd service for the module
+}
+
+LINUWUX_DEFAULT_ENV = {
+    "PROTON_AVX": "1",
+    "LINUWUX_ARTIFACT_AMD_V2": "1",
+}
+
+# --- Output ----------------------------------------------------------------
+
+_TTY = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def _c(code: str, text: str) -> str:
+    return f"\033[{code}m{text}\033[0m" if _TTY else text
+
+
+def info(msg: str) -> None:
+    print(f"{_c('36', '[i]')} {msg}")
+
+
+def ok(msg: str) -> None:
+    print(f"{_c('32', '[ok]')} {msg}")
+
+
+def warn(msg: str) -> None:
+    print(f"{_c('33', '[!]')} {msg}")
+
+
+def err(msg: str) -> None:
+    print(f"{_c('31', '[x]')} {msg}", file=sys.stderr)
+
+
+def die(msg: str, code: int = 1):
+    err(msg)
+    raise SystemExit(code)
+
+
+def confirm(question: str, default: bool = False, assume_yes: bool = False) -> bool:
+    if assume_yes:
+        return True
+    if not sys.stdin.isatty():
+        warn(f"Not interactive, use --yes to confirm: {question}")
+        return False
+    suffix = "[Y/n]" if default else "[y/N]"
+    try:
+        answer = input(f"{question} {suffix} ").strip().lower()
+    except EOFError:
+        return False
+    if not answer:
+        return default
+    return answer.startswith("y")
+
+
+# --- Config ----------------------------------------------------------------
+
+
+def ensure_dirs() -> None:
+    for d in (CONFIG_DIR, DATA_DIR, STATE_DIR, PREFIX_DIR, ICON_DIR, LOG_DIR):
+        d.mkdir(parents=True, exist_ok=True)
+
+
+def load_json(path: Path, fallback):
+    try:
+        with path.open(encoding="utf-8") as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        return fallback
+    except (json.JSONDecodeError, OSError) as exc:
+        warn(f"Cannot read {path} ({exc}); using defaults")
+        return fallback
+
+
+def save_json(path: Path, data) -> None:
+    ensure_dirs()
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
+    tmp.replace(path)
+
+
+def load_settings() -> dict:
+    data = dict(DEFAULT_SETTINGS)
+    data.update(load_json(SETTINGS_FILE, {}) or {})
+    return data
+
+
+def save_settings(settings: dict) -> None:
+    save_json(SETTINGS_FILE, settings)
+
+
+def load_games() -> list[dict]:
+    games = load_json(GAMES_FILE, [])
+    return games if isinstance(games, list) else []
+
+
+def save_games(games: list[dict]) -> None:
+    save_json(GAMES_FILE, games)
+
+
+# --- Small helpers ---------------------------------------------------------
+
+
+def which(name: str) -> str | None:
+    return shutil.which(name)
+
+
+def run_cmd(argv: list[str], **kwargs) -> int:
+    return subprocess.run(argv, **kwargs).returncode
+
+
+def slugify(text: str) -> str:
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
+    text = re.sub(r"[^\w\s-]", "", text).strip().lower()
+    text = re.sub(r"[\s_-]+", "-", text)
+    return text or "game"
+
+
+def unique_id(base: str, games: list[dict]) -> str:
+    taken = {g.get("id") for g in games}
+    if base not in taken:
+        return base
+    for n in range(2, 1000):
+        candidate = f"{base}-{n}"
+        if candidate not in taken:
+            return candidate
+    raise RuntimeError("no free id")
+
+
+def host_ram_mib() -> int:
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) // 1024
+    except OSError:
+        pass
+    return 8192
+
+
+def cpu_flags() -> set[str]:
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("flags"):
+                    return set(line.split(":", 1)[1].split())
+    except OSError:
+        pass
+    return set()
+
+
+def cpu_vendor() -> str:
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("vendor_id"):
+                    return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return "unknown"
+
+
+def kernel_release() -> str:
+    return os.uname().release
+
+
+def kvm_available() -> bool:
+    return os.access("/dev/kvm", os.R_OK | os.W_OK)
+
+
+def umip_enabled() -> bool:
+    return "umip" in cpu_flags()
+
+
+def cpuid_faulting_native() -> bool:
+    return "cpuid_fault" in cpu_flags()
+
+
+def loaded_modules() -> set[str]:
+    try:
+        with open("/proc/modules", encoding="utf-8") as fh:
+            return {line.split()[0] for line in fh if line.strip()}
+    except OSError:
+        return set()
+
+
+def module_loaded() -> bool:
+    return MODULE_NAME in loaded_modules()
+
+
+def kvm_loaded() -> bool:
+    return bool({"kvm", "kvm_amd", "kvm_intel"} & loaded_modules())
+
+
+def needs_cpuid_module() -> bool:
+    """AMD before Zen 4 has no architectural CPUID faulting."""
+    return not cpuid_faulting_native() and cpu_vendor() == "AuthenticAMD"
+
+
+def service_available() -> bool:
+    if not which("systemctl"):
+        return False
+    return subprocess.run(["systemctl", "cat", SERVICE_NAME],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+
+def module_vermagic(path: Path) -> str:
+    if not which("modinfo") or not path.is_file():
+        return ""
+    out = subprocess.run(["modinfo", "-F", "vermagic", str(path)],
+                         capture_output=True, text=True, check=False).stdout.strip()
+    return out.split()[0] if out else ""
+
+
+def sudo_prefix() -> list[str]:
+    return [] if os.geteuid() == 0 else ["sudo"]
+
+
+# --- Detection: Steam, Proton, runtimes ------------------------------------
+
+
+def steam_roots() -> list[Path]:
+    candidates = [
+        Path.home() / ".local/share/Steam",
+        Path.home() / ".steam/steam",
+        Path.home() / ".steam/root",
+        Path.home() / ".var/app/com.valvesoftware.Steam/.local/share/Steam",
+    ]
+    roots: list[Path] = []
+    for c in candidates:
+        if not c.is_dir():
+            continue
+        real = c.resolve()
+        if real not in roots:
+            roots.append(real)
+    return roots
+
+
+def steam_libraries() -> list[Path]:
+    libs: list[Path] = []
+    for root in steam_roots():
+        if root not in libs:
+            libs.append(root)
+        vdf = root / "steamapps/libraryfolders.vdf"
+        if not vdf.is_file():
+            continue
+        try:
+            text = vdf.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for match in re.finditer(r'"path"\s+"([^"]+)"', text):
+            p = Path(match.group(1).replace("\\\\", "\\"))
+            if p.is_dir() and p not in libs:
+                libs.append(p)
+    return libs
+
+
+def list_protons() -> list[Path]:
+    found: list[Path] = []
+    bases: list[Path] = []
+    for root in steam_roots():
+        bases += [root / "compatibilitytools.d", root / "steamapps/common"]
+    bases += [Path.home() / ".local/share/umu",
+              Path.home() / ".local/share/lutris/runners/proton"]
+    for base in bases:
+        if not base.is_dir():
+            continue
+        try:
+            entries = sorted(base.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            script = entry / "proton"
+            if script.is_file() and os.access(script, os.X_OK) and script not in found:
+                found.append(script)
+    return found
+
+
+def proton_from_prefix(prefix: Path | str) -> Path | None:
+    """Which Proton does this prefix belong to?
+
+    Switching builds makes Proton upgrade the prefix and invalidates the shader
+    cache, so always prefer the one already recorded inside it.
+    """
+    prefix = Path(prefix)
+    if not prefix.is_dir():
+        return None
+
+    info_file = prefix / "config_info"
+    if info_file.is_file():
+        try:
+            for line in info_file.read_text(encoding="utf-8", errors="replace").splitlines():
+                if "/files/" in line:
+                    candidate = Path(line.split("/files/")[0]) / "proton"
+                    if candidate.is_file() and os.access(candidate, os.X_OK):
+                        return candidate
+                    break
+        except OSError:
+            pass
+
+    version_file = prefix / "version"
+    if version_file.is_file():
+        try:
+            name = version_file.read_text(encoding="utf-8", errors="replace").strip().splitlines()[0]
+        except (OSError, IndexError):
+            return None
+        if name:
+            for script in list_protons():
+                if name in script.parent.name:
+                    return script
+    return None
+
+
+def _proton_rank(path: Path) -> tuple:
+    name = path.parent.name.lower()
+    if "cachyos" in name:
+        family = 0
+    elif "ge-proton" in name or "proton-ge" in name:
+        family = 1
+    elif "umu" in name:
+        family = 2
+    elif "experimental" in name:
+        family = 3
+    else:
+        family = 4
+    nums = [int(n) for n in re.findall(r"\d+", path.parent.name)[:4]]
+    nums += [0] * (4 - len(nums))
+    return (family, [-n for n in nums])
+
+
+def pick_proton(preferred: str = "", prefix: Path | str | None = None) -> Path | None:
+    if preferred:
+        p = Path(preferred).expanduser()
+        if p.is_dir():
+            p = p / "proton"
+        if p.is_file():
+            return p
+        warn(f"Configured Proton not found: {preferred}")
+
+    if prefix:
+        from_prefix = proton_from_prefix(prefix)
+        if from_prefix:
+            return from_prefix
+
+    protons = list_protons()
+    if not protons:
+        return None
+    return sorted(protons, key=_proton_rank)[0]
+
+
+def find_legion(settings: dict) -> Path | None:
+    configured = settings.get("legion_path") or os.environ.get("BARAN_LEGION")
+    if configured:
+        p = Path(configured).expanduser()
+        if p.is_file() and os.access(p, os.X_OK):
+            return p
+        warn(f"Configured Legion binary unusable: {configured}")
+    candidates = [
+        DATA_DIR / "legion",
+        Path.home() / ".local/bin/legion",
+        Path.home() / "legion-kvm/build/dist/legion",
+    ]
+    found = which("legion")
+    if found:
+        candidates.insert(0, Path(found))
+    for c in candidates:
+        if c.is_file() and os.access(c, os.X_OK):
+            return c
+    return None
+
+
+def legion_usable(settings: dict) -> tuple[bool, str]:
+    binary = find_legion(settings)
+    if binary is None:
+        return False, "legion binary not found"
+    if not kvm_available():
+        return False, "/dev/kvm not accessible"
+    return True, str(binary)
+
+
+def find_linuwux(settings: dict) -> Path | None:
+    configured = settings.get("linuwux_lib")
+    if configured:
+        p = Path(configured).expanduser()
+        if p.is_file():
+            return p
+        warn(f"Configured LinUwUx library not found: {configured}")
+    default = Path.home() / ".local/share/linuwux/LinUwUx.so"
+    return default if default.is_file() else None
+
+
+def find_module_ko(settings: dict) -> Path | None:
+    configured = settings.get("module_ko")
+    if configured:
+        p = Path(configured).expanduser()
+        if p.is_file():
+            return p
+    local = Path.home() / "cpuid-fault-emulation" / f"{MODULE_NAME}.ko"
+    if local.is_file():
+        return local
+    base = Path("/lib/modules") / kernel_release()
+    if base.is_dir():
+        for candidate in base.rglob(f"{MODULE_NAME}.ko*"):
+            return candidate
+    return None
+
+
+def linuwux_usable(settings: dict) -> tuple[bool, str]:
+    if find_linuwux(settings) is None:
+        return False, "LinUwUx.so not found (baran build-linuwux)"
+    if umip_enabled():
+        return False, "UMIP is enabled (baran umip)"
+    if not needs_cpuid_module():
+        return True, "native CPUID faulting"
+    if module_loaded():
+        return True, "module loaded"
+    if service_available():
+        return True, "systemd service available"
+    ko = find_module_ko(settings)
+    if ko is None:
+        return False, "CPUID module missing (baran build-module)"
+    if module_vermagic(ko) != kernel_release():
+        return False, "module built for another kernel (baran build-module)"
+    return True, str(ko)
+
+
+# --- CPUID module: load, unload, restore KVM -------------------------------
+
+
+def state_write(method: str, kvm_was_loaded: bool) -> None:
+    ensure_dirs()
+    save_json(STATE_FILE, {
+        "method": method,
+        "kvm_was_loaded": kvm_was_loaded,
+        "kernel": kernel_release(),
+        "time": datetime.now().isoformat(timespec="seconds"),
+    })
+
+
+def state_read() -> dict:
+    return load_json(STATE_FILE, {}) or {}
+
+
+def state_clear() -> None:
+    STATE_FILE.unlink(missing_ok=True)
+
+
+def prepare_cpuid(settings: dict, assume_yes: bool = False) -> tuple[bool, bool]:
+    """Make CPUID faulting available.
+
+    Returns (ready, loaded_by_us). Unloads KVM when the module is needed.
+    """
+    if umip_enabled():
+        err("UMIP is enabled; LinUwUx cannot work. Run 'baran umip' for instructions.")
+        return False, False
+
+    if not needs_cpuid_module():
+        return True, False
+
+    if module_loaded():
+        if kvm_loaded():
+            err("KVM and the CPUID module are both loaded; that conflicts.")
+            return False, False
+        return True, False
+
+    if cpu_vendor() != "AuthenticAMD":
+        err(f"The CPUID module only supports AMD CPUs (found {cpu_vendor()}).")
+        return False, False
+
+    warn("Loading an experimental kernel module; KVM will be unloaded while it is active.")
+    if not confirm("Continue?", default=False, assume_yes=assume_yes):
+        return False, False
+
+    sudo = sudo_prefix()
+
+    if settings.get("use_service", True) and service_available():
+        info(f"Starting {SERVICE_NAME}")
+        rc = run_cmd(["systemctl", "start", SERVICE_NAME],
+                     stderr=subprocess.DEVNULL)
+        if rc != 0:
+            rc = run_cmd(sudo + ["systemctl", "start", SERVICE_NAME])
+        if rc != 0 or not module_loaded():
+            err("Could not start the service")
+            return False, False
+        state_write("service", False)
+        ok("CPUID emulation active (systemd service)")
+        return True, True
+
+    ko = find_module_ko(settings)
+    if ko is None:
+        err("CPUID module not built. Run: baran build-module")
+        return False, False
+    vermagic = module_vermagic(ko)
+    if vermagic and vermagic != kernel_release():
+        err(f"Module was built for {vermagic}, running kernel is {kernel_release()}.")
+        err("Rebuild with: baran build-module")
+        return False, False
+
+    kvm_was = kvm_loaded()
+    if kvm_was:
+        info("Unloading KVM")
+        for mod in ("kvm_amd", "kvm_intel", "kvm"):
+            if mod in loaded_modules():
+                run_cmd(sudo + ["modprobe", "-r", mod], stderr=subprocess.DEVNULL)
+        if kvm_loaded():
+            err("KVM could not be unloaded. Stop running VMs and try again.")
+            return False, False
+
+    info(f"Loading {ko}")
+    if run_cmd(sudo + ["insmod", str(ko)]) != 0 or not module_loaded():
+        err("insmod failed")
+        if kvm_was:
+            run_cmd(sudo + ["modprobe", "kvm_amd"], stderr=subprocess.DEVNULL)
+        return False, False
+
+    state_write("manual", kvm_was)
+    ok("CPUID emulation active")
+    return True, True
+
+
+def unprepare_cpuid(force: bool = False) -> bool:
+    """Unload the module and bring KVM back."""
+    state = state_read()
+    sudo = sudo_prefix()
+
+    if module_loaded():
+        if not force and subprocess.run(["pgrep", "-f", r"\.exe"],
+                                        stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL).returncode == 0:
+            warn("A Windows process still seems to be running.")
+        if state.get("method") == "service" or (not state and service_available()):
+            info(f"Stopping {SERVICE_NAME}")
+            rc = run_cmd(["systemctl", "stop", SERVICE_NAME], stderr=subprocess.DEVNULL)
+            if rc != 0:
+                rc = run_cmd(sudo + ["systemctl", "stop", SERVICE_NAME])
+        else:
+            info("Unloading CPUID module")
+            run_cmd(sudo + ["modprobe", "-r", MODULE_NAME], stderr=subprocess.DEVNULL)
+        if module_loaded():
+            err("Module is still loaded")
+            return False
+
+    if state.get("kvm_was_loaded") and not kvm_loaded():
+        info("Loading KVM again")
+        mod = "kvm_amd" if cpu_vendor() == "AuthenticAMD" else "kvm_intel"
+        run_cmd(sudo + ["modprobe", mod], stderr=subprocess.DEVNULL)
+
+    state_clear()
+    ok("Cleaned up" + (", KVM is back" if kvm_loaded() else ""))
+    return True
+
+
+# --- Game records ----------------------------------------------------------
+
+
+def make_game(exe: Path, name: str = "", runtime: str = "auto",
+              args: list[str] | None = None, games: list[dict] | None = None) -> dict:
+    games = games if games is not None else load_games()
+    exe = exe.expanduser().resolve()
+    display = name or exe.stem
+    gid = unique_id(slugify(display), games)
+    return {
+        "id": gid,
+        "name": display,
+        "exe": str(exe),
+        "args": args or [],
+        "prefix": str(PREFIX_DIR / gid),
+        "proton": "",
+        "runtime": runtime,
+        "env": {},
+        "icon": "",
+        "added": datetime.now().isoformat(timespec="seconds"),
+        "last_played": "",
+    }
+
+
+def find_game(games: list[dict], needle: str) -> dict | None:
+    for g in games:
+        if g.get("id") == needle:
+            return g
+    lowered = needle.lower()
+    matches = [g for g in games if lowered in g.get("name", "").lower()]
+    return matches[0] if len(matches) == 1 else None
+
+
+def resolve_runtime(game: dict, settings: dict) -> str:
+    wanted = game.get("runtime") or settings.get("default_runtime") or "auto"
+    if wanted != "auto":
+        return wanted
+    usable, _ = legion_usable(settings)
+    return "legion" if usable else "proton"
+
+
+# --- Building the launch command -------------------------------------------
+
+
+def build_command(game: dict, settings: dict) -> tuple[list[str], dict[str, str], str]:
+    exe = Path(game["exe"]).expanduser()
+    if not exe.is_file():
+        die(f"Game executable missing: {exe}")
+
+    prefix = Path(game.get("prefix") or (PREFIX_DIR / game["id"])).expanduser()
+    prefix.mkdir(parents=True, exist_ok=True)
+
+    runtime = resolve_runtime(game, settings)
+    env: dict[str, str] = {}
+
+    proton_script = pick_proton(game.get("proton") or settings.get("default_proton", ""),
+                                prefix=prefix)
+    umu = which("umu-run") if settings.get("use_umu", True) else None
+    use_umu = bool(umu) and not game.get("proton") and runtime != "linuwux"
+
+    if use_umu:
+        base = [umu, str(exe), *game.get("args", [])]
+        env["GAMEID"] = game["id"]
+        env["WINEPREFIX"] = str(prefix)
+        if proton_script:
+            env["PROTONPATH"] = str(proton_script.parent)
+    else:
+        if proton_script is None:
+            die("No Proton found. Install Proton or umu-run, see 'baran doctor'.")
+        client = steam_roots()[0] if steam_roots() else (DATA_DIR / "steam-compat")
+        Path(client).mkdir(parents=True, exist_ok=True)
+        base = [str(proton_script), "run", str(exe), *game.get("args", [])]
+        env["STEAM_COMPAT_DATA_PATH"] = str(prefix)
+        env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = str(client)
+
+    if runtime == "legion":
+        usable, detail = legion_usable(settings)
+        if not usable:
+            warn(f"Legion unusable ({detail}); falling back to Proton")
+            runtime = "proton"
+        else:
+            mem = int(settings.get("legion_memory_mib") or 0)
+            if mem <= 0:
+                mem = max(4096, min(12288, int(host_ram_mib() * 0.6) // 512 * 512))
+            env["LEGION_MEMORY_MIB"] = str(mem)
+            if settings.get("legion_fullscreen"):
+                env["LEGION_FULLSCREEN"] = "1"
+            if use_umu or proton_script is None:
+                argv = [detail, *base]
+            else:
+                argv = [detail, "run", "--proton", str(proton_script.parent),
+                        "--prefix", str(prefix), "--", str(exe), *game.get("args", [])]
+            env.update({k: str(v) for k, v in (game.get("env") or {}).items()})
+            return argv, env, "legion"
+
+    if runtime == "linuwux":
+        lib = find_linuwux(settings)
+        if lib is None:
+            die("LinUwUx.so not found. Run: baran build-linuwux")
+        preload = str(lib)
+        existing = os.environ.get("LD_PRELOAD", "")
+        if preload not in existing.split(":"):
+            env["LD_PRELOAD"] = preload + (f":{existing}" if existing else "")
+        for key, value in LINUWUX_DEFAULT_ENV.items():
+            env.setdefault(key, value)
+
+    env.update({k: str(v) for k, v in (game.get("env") or {}).items()})
+    return base, env, runtime
+
+
+def format_command(argv: list[str], env: dict[str, str]) -> str:
+    import shlex
+    parts = [f"{k}={shlex.quote(v)}" for k, v in sorted(env.items())]
+    parts += [shlex.quote(a) for a in argv]
+    return " ".join(parts)
+
+
+# --- Launching -------------------------------------------------------------
+
+
+def launch_game(game: dict, settings: dict, detach: bool = False,
+                print_only: bool = False, assume_yes: bool = False,
+                keep_module: bool = False) -> int:
+    argv, extra_env, runtime = build_command(game, settings)
+
+    if print_only:
+        print(format_command(argv, extra_env))
+        return 0
+
+    loaded_by_us = False
+    if runtime == "linuwux":
+        ready, loaded_by_us = prepare_cpuid(settings, assume_yes=assume_yes)
+        if not ready:
+            return 1
+
+    env = os.environ.copy()
+    env.update(extra_env)
+    workdir = Path(game["exe"]).parent
+
+    ensure_dirs()
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_path = LOG_DIR / f"{game['id']}-{stamp}.log"
+    latest = LOG_DIR / "latest.log"
+
+    info(f"Starting {game['name']} via {runtime}")
+    info(f"Log: {log_path}")
+
+    games = load_games()
+    for g in games:
+        if g.get("id") == game.get("id"):
+            g["last_played"] = datetime.now().isoformat(timespec="seconds")
+    save_games(games)
+
+    rc = 0
+    try:
+        with log_path.open("w", encoding="utf-8") as log:
+            log.write(f"# {format_command(argv, extra_env)}\n")
+            log.flush()
+            try:
+                latest.unlink(missing_ok=True)
+                latest.symlink_to(log_path.name)
+            except OSError:
+                pass
+            try:
+                if detach:
+                    subprocess.Popen(argv, cwd=workdir, env=env, stdout=log,
+                                     stderr=subprocess.STDOUT, start_new_session=True)
+                    ok(f"{game['name']} started")
+                    if loaded_by_us and not keep_module:
+                        warn("CPUID module stays loaded; run 'baran unprepare' when done.")
+                    return 0
+                rc = subprocess.run(argv, cwd=workdir, env=env).returncode
+            except FileNotFoundError:
+                err(f"Cannot execute: {argv[0]}")
+                rc = 127
+            except KeyboardInterrupt:
+                rc = 130
+    finally:
+        if loaded_by_us and not detach:
+            if keep_module:
+                info("Keeping the CPUID module loaded (--keep)")
+            else:
+                unprepare_cpuid(force=True)
+    return rc
+
+
+# --- Desktop entries -------------------------------------------------------
+
+
+def desktop_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+
+
+def game_icon(game: dict) -> str:
+    icon = game.get("icon") or ""
+    return icon if icon and Path(icon).is_file() else "applications-games"
+
+
+def write_shortcut(game: dict) -> Path:
+    APPLICATIONS_DIR.mkdir(parents=True, exist_ok=True)
+    path = APPLICATIONS_DIR / f"baran-{game['id']}.desktop"
+    exec_line = f'"{desktop_escape(str(SELF))}" run "{desktop_escape(game["id"])}"'
+    path.write_text(
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        f"Name={game['name']}\n"
+        f"Comment=Start with {APP_NAME}\n"
+        f"Exec={exec_line}\n"
+        f"Icon={game_icon(game)}\n"
+        "Terminal=false\n"
+        "Categories=Game;\n"
+        "StartupNotify=true\n"
+        f"X-Baran-Id={game['id']}\n",
+        encoding="utf-8")
+    path.chmod(0o755)
+    refresh_desktop_db()
+    return path
+
+
+def write_app_shortcut() -> Path:
+    APPLICATIONS_DIR.mkdir(parents=True, exist_ok=True)
+    path = APPLICATIONS_DIR / "baran.desktop"
+    path.write_text(
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        f"Name={APP_NAME}\n"
+        "Comment=Run Windows games on Linux\n"
+        f'Exec="{desktop_escape(str(SELF))}" gui\n'
+        "Icon=applications-games\n"
+        "Terminal=false\n"
+        "Categories=Game;Utility;\n"
+        "StartupNotify=true\n",
+        encoding="utf-8")
+    path.chmod(0o755)
+    refresh_desktop_db()
+    return path
+
+
+def remove_shortcut(game_id: str) -> None:
+    path = APPLICATIONS_DIR / f"baran-{game_id}.desktop"
+    if path.exists():
+        path.unlink()
+        refresh_desktop_db()
+
+
+def refresh_desktop_db() -> None:
+    tool = which("update-desktop-database")
+    if tool:
+        subprocess.run([tool, str(APPLICATIONS_DIR)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+
+def extract_icon(exe: Path, game_id: str) -> str:
+    wrestool, icotool = which("wrestool"), which("icotool")
+    if not (wrestool and icotool):
+        return ""
+    ensure_dirs()
+    tmp = ICON_DIR / f"{game_id}.ico"
+    try:
+        with tmp.open("wb") as fh:
+            res = subprocess.run([wrestool, "-x", "-t", "14", str(exe)],
+                                 stdout=fh, stderr=subprocess.DEVNULL, check=False)
+        if res.returncode != 0 or tmp.stat().st_size == 0:
+            tmp.unlink(missing_ok=True)
+            return ""
+        subprocess.run([icotool, "-x", "-o", str(ICON_DIR), str(tmp)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        tmp.unlink(missing_ok=True)
+        pngs = sorted(ICON_DIR.glob(f"{game_id}*.png"),
+                      key=lambda p: p.stat().st_size, reverse=True)
+        if pngs:
+            target = ICON_DIR / f"{game_id}.png"
+            if pngs[0] != target:
+                pngs[0].replace(target)
+            for leftover in ICON_DIR.glob(f"{game_id}*.png"):
+                if leftover != target:
+                    leftover.unlink(missing_ok=True)
+            return str(target)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+    return ""
+
+
+# --- Adding and scanning ---------------------------------------------------
+
+SKIP_EXE = re.compile(
+    r"(unins|uninstall|setup|install|crashhandler|crashreport|vcredist|dxsetup|"
+    r"directx|dotnet|launcher_helper|redist|benchmark|config\.exe|touchup|"
+    r"webhelper|prereq|easyanticheat|battleye|oalinst|dotnetfx|ue4prereq)",
+    re.IGNORECASE)
+
+SCAN_DIRS = [
+    Path.home() / "Games", Path.home() / "Spiele", Path.home() / "Downloads",
+    Path.home() / "Desktop", Path.home() / "Schreibtisch",
+]
+
+
+def add_game(exe: Path, name: str = "", runtime: str = "auto",
+             args: list[str] | None = None, shortcut: bool = True) -> dict:
+    exe = exe.expanduser().resolve()
+    if not exe.is_file():
+        die(f"File not found: {exe}")
+    if exe.suffix.lower() != ".exe":
+        warn(f"{exe.name} is not an .exe; adding anyway")
+
+    games = load_games()
+    for g in games:
+        if Path(g["exe"]) == exe:
+            warn(f"Already present: {g['name']} ({g['id']})")
+            return g
+
+    game = make_game(exe, name=name, runtime=runtime, args=args, games=games)
+    icon = extract_icon(exe, game["id"])
+    if icon:
+        game["icon"] = icon
+    games.append(game)
+    save_games(games)
+    ok(f"Added: {game['name']} ({game['id']})")
+    if shortcut:
+        ok(f"Desktop entry: {write_shortcut(game)}")
+    return game
+
+
+def scan_exes(extra_dirs: list[Path] | None = None, limit: int = 400) -> list[Path]:
+    roots = list(SCAN_DIRS)
+    for lib in steam_libraries():
+        common = lib / "steamapps/common"
+        if common.is_dir():
+            roots.append(common)
+    roots += extra_dirs or []
+
+    known = {Path(g["exe"]).resolve() for g in load_games()}
+    results: list[Path] = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for path in root.rglob("*.exe"):
+            if len(results) >= limit:
+                return results
+            try:
+                if path.stat().st_size < 1_000_000:
+                    continue
+            except OSError:
+                continue
+            if SKIP_EXE.search(path.name) or ".cache" in path.parts or "Trash" in path.parts:
+                continue
+            resolved = path.resolve()
+            if resolved in known or resolved in results:
+                continue
+            results.append(resolved)
+    return results
+
+
+# --- Diagnostics -----------------------------------------------------------
+
+
+def doctor_report(settings: dict | None = None) -> tuple[list[tuple[str, str, str]], str]:
+    settings = settings or load_settings()
+    rows: list[tuple[str, str, str]] = []
+
+    rows.append(("ok", "System", f"{os.uname().sysname} {kernel_release()} ({os.uname().machine})"))
+
+    protons = list_protons()
+    if protons:
+        best = pick_proton(settings.get("default_proton", ""))
+        rows.append(("ok", "Proton", f"{len(protons)} found, preferred: {best.parent.name if best else '?'}"))
+    else:
+        rows.append(("err", "Proton", "none found; install Proton (Steam/GE) or umu-run"))
+
+    umu = which("umu-run")
+    rows.append(("ok" if umu else "warn", "umu-run", umu or "not installed (optional)"))
+
+    # Legion
+    usable, detail = legion_usable(settings)
+    rows.append(("ok" if usable else "warn", "Legion", detail if usable else f"unavailable: {detail}"))
+    if kvm_available():
+        rows.append(("ok", "KVM", "/dev/kvm usable"))
+    elif Path("/dev/kvm").exists():
+        rows.append(("warn", "KVM", "/dev/kvm exists but no permission (group 'kvm')"))
+    else:
+        rows.append(("warn", "KVM", "/dev/kvm missing"))
+
+    # LinUwUx
+    lib = find_linuwux(settings)
+    rows.append(("ok" if lib else "warn", "LinUwUx",
+                 str(lib) if lib else "not installed (baran build-linuwux)"))
+    if umip_enabled():
+        rows.append(("warn", "UMIP", "enabled; linuwux runtime needs it off (baran umip)"))
+    else:
+        rows.append(("ok", "UMIP", "disabled"))
+    if cpuid_faulting_native():
+        rows.append(("ok", "CPUID", "native faulting, no kernel module needed"))
+    elif needs_cpuid_module():
+        if module_loaded():
+            rows.append(("ok", "CPUID", "emulation module loaded"))
+        elif service_available():
+            rows.append(("ok", "CPUID", "systemd service installed, module loads on demand"))
+        else:
+            ko = find_module_ko(settings)
+            if ko and module_vermagic(ko) == kernel_release():
+                rows.append(("ok", "CPUID", f"module built: {ko}"))
+            elif ko:
+                rows.append(("warn", "CPUID", f"module built for {module_vermagic(ko)}, kernel is {kernel_release()}"))
+            else:
+                rows.append(("warn", "CPUID", "no module (only needed for the linuwux runtime)"))
+    else:
+        rows.append(("warn", "CPUID", f"no native faulting and CPU is {cpu_vendor()}"))
+
+    session = os.environ.get("XDG_SESSION_TYPE", "?")
+    rows.append(("ok" if session == "wayland" else "warn", "Session",
+                 f"{session} (Legion prefers Wayland)"))
+
+    ram = host_ram_mib()
+    mem = int(settings.get("legion_memory_mib") or 0) or max(4096, min(12288, int(ram * 0.6) // 512 * 512))
+    rows.append(("ok" if ram >= 8192 else "warn", "Memory", f"{ram} MiB host, {mem} MiB planned for VM"))
+
+    games = load_games()
+    missing = [g for g in games if not Path(g["exe"]).is_file()]
+    if games:
+        detail = f"{len(games)} game(s)"
+        if missing:
+            detail += f", {len(missing)} with missing files"
+        rows.append(("warn" if missing else "ok", "Games", detail))
+    else:
+        rows.append(("warn", "Games", "none yet; use 'baran add' or the GUI"))
+
+    for game in games:
+        prefix = Path(game.get("prefix", ""))
+        recorded = proton_from_prefix(prefix) if prefix.is_dir() else None
+        if not recorded:
+            continue
+        chosen = pick_proton(game.get("proton") or settings.get("default_proton", ""), prefix=prefix)
+        if chosen and chosen != recorded:
+            rows.append(("warn", "Prefix",
+                         f"{game['id']}: belongs to {recorded.parent.name}, "
+                         f"would run {chosen.parent.name} (shader cache resets)"))
+
+    counts = {"ok": 0, "warn": 0, "err": 0}
+    for state, _, _ in rows:
+        counts[state] += 1
+    summary = f"{counts['ok']} ok, {counts['warn']} notes, {counts['err']} errors"
+    return rows, summary
+
+
+def cmd_doctor(_args) -> int:
+    rows, summary = doctor_report()
+    symbols = {"ok": _c("32", "[ok]"), "warn": _c("33", "[!]"), "err": _c("31", "[x]")}
+    for state, title, detail in rows:
+        print(f"{symbols[state]} {title:<9} {detail}")
+    print(f"\n{summary}")
+    return 1 if any(s == "err" for s, _, _ in rows) else 0
+
+
+def cmd_umip(_args) -> int:
+    if not umip_enabled():
+        ok("UMIP is already disabled")
+        return 0
+    err("UMIP is enabled; the linuwux runtime cannot work")
+    try:
+        cmdline = Path("/proc/cmdline").read_text(encoding="utf-8").strip()
+        info(f"Current kernel cmdline: {cmdline}")
+    except OSError:
+        pass
+    print("\nAdd clearcpuid=514 to your kernel command line, then reboot.\n")
+    if which("rpm-ostree"):
+        print("  sudo rpm-ostree kargs --append=clearcpuid=514")
+    elif Path("/etc/default/grub").is_file():
+        print("  sudoedit /etc/default/grub        # GRUB_CMDLINE_LINUX_DEFAULT=\"... clearcpuid=514\"")
+        print("  sudo grub-mkconfig -o /boot/grub/grub.cfg")
+    elif Path("/etc/kernel/cmdline").is_file():
+        print("  sudoedit /etc/kernel/cmdline      # add clearcpuid=514")
+        print("  sudo mkinitcpio -P")
+    elif Path("/boot/limine.conf").is_file():
+        print("  edit your Limine entry, then: sudo limine-update")
+    else:
+        print("  add clearcpuid=514 using your bootloader's usual method")
+    print("\nThis taints the kernel; remove the parameter to undo it.")
+    return 0
+
+
+# --- Building the pieces ---------------------------------------------------
+
+
+def _git_checkout(src: Path, repo: str, ref: str) -> bool:
+    if not (src / ".git").is_dir():
+        if src.exists() and any(src.iterdir()):
+            err(f"{src} exists and is not a git clone")
+            return False
+        src.parent.mkdir(parents=True, exist_ok=True)
+        if run_cmd(["git", "clone", repo, str(src)]) != 0:
+            return False
+    dirty = subprocess.run(["git", "-C", str(src), "status", "--porcelain"],
+                           capture_output=True, text=True, check=False).stdout.strip()
+    if dirty:
+        err(f"Local changes in {src}; commit or discard them first")
+        return False
+    match = re.fullmatch(r"pr(\d+)", ref)
+    if match:
+        fetch = ["git", "-C", str(src), "fetch", "--depth=1", "origin",
+                 f"pull/{match.group(1)}/head"]
+    else:
+        fetch = ["git", "-C", str(src), "fetch", "origin", ref]
+    if run_cmd(fetch) != 0:
+        return False
+    return run_cmd(["git", "-C", str(src), "checkout", "--detach", "FETCH_HEAD"]) == 0
+
+
+def cmd_build_linuwux(args) -> int:
+    settings = load_settings()
+    ref = args.ref or settings.get("linuwux_ref") or "pr58"
+    src = Path(args.src).expanduser() if args.src else Path.home() / "linuwux-runtime"
+
+    for tool in ("git", "cargo", "cc"):
+        if not which(tool):
+            die(f"{tool} is missing. On Arch: sudo pacman -S --needed git base-devel rust")
+
+    info(f"Source: {src}")
+    info(f"Ref:    {ref}")
+    if not _git_checkout(src, LINUWUX_REPO, ref):
+        return 1
+
+    info("Building LinUwUx (this takes a few minutes)")
+    if run_cmd(["cargo", "xtask", "build"], cwd=src) != 0:
+        return 1
+
+    built = src / "target/runtime/LinUwUx.so"
+    if not built.is_file():
+        die(f"Build produced no library at {built}")
+
+    target = Path.home() / ".local/share/linuwux/LinUwUx.so"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(built, target)
+    target.chmod(0o644)
+    settings["linuwux_lib"] = str(target)
+    save_settings(settings)
+    ok(f"Installed: {target}")
+    return 0
+
+
+def cmd_build_module(args) -> int:
+    settings = load_settings()
+    src = Path(args.src).expanduser() if args.src else Path.home() / "cpuid-fault-emulation"
+
+    for tool in ("git", "make", "gcc"):
+        if not which(tool):
+            die(f"{tool} is missing. On Arch: sudo pacman -S --needed git base-devel")
+    build_dir = Path("/lib/modules") / kernel_release() / "build"
+    if not (build_dir / "Makefile").is_file():
+        die(f"Kernel headers missing for {kernel_release()} "
+            "(Arch: linux-headers, CachyOS: linux-cachyos-headers)")
+
+    if not _git_checkout(src, MODULE_REPO, args.ref or "main"):
+        return 1
+
+    jobs = str(args.jobs or os.cpu_count() or 2)
+    info(f"Building module for kernel {kernel_release()}")
+    if run_cmd(["make", "-C", str(build_dir), f"M={src}", f"-j{jobs}", "modules"]) != 0:
+        return 1
+
+    ko = src / f"{MODULE_NAME}.ko"
+    if not ko.is_file():
+        die(f"Module not found: {ko}")
+    vermagic = module_vermagic(ko)
+    if vermagic != kernel_release():
+        warn(f"vermagic {vermagic} differs from running kernel {kernel_release()}")
+    settings["module_ko"] = str(ko)
+    save_settings(settings)
+    ok(f"Built: {ko}")
+
+    if args.dkms:
+        return _install_dkms(src)
+    info("Load it on demand with: baran prepare")
+    return 0
+
+
+def _install_dkms(src: Path) -> int:
+    if not which("dkms"):
+        die("dkms is missing. On Arch: sudo pacman -S --needed dkms")
+    sudo = sudo_prefix()
+    version = "0.1"
+    conf = src / "dkms.conf"
+    if conf.is_file():
+        match = re.search(r'PACKAGE_VERSION="([^"]+)"', conf.read_text(encoding="utf-8"))
+        if match:
+            version = match.group(1)
+
+    dest = Path(f"/usr/src/{MODULE_NAME}-{version}")
+    info(f"Installing sources to {dest}")
+    run_cmd(sudo + ["rm", "-rf", str(dest)])
+    run_cmd(sudo + ["mkdir", "-p", str(dest)])
+    tar_out = subprocess.Popen(
+        ["tar", "--exclude=.git", "--exclude=*.ko", "-C", str(src), "-cf", "-", "."],
+        stdout=subprocess.PIPE)
+    subprocess.run(sudo + ["tar", "-C", str(dest), "-xf", "-"], stdin=tar_out.stdout, check=False)
+    tar_out.wait()
+
+    run_cmd(sudo + ["dkms", "remove", "-m", MODULE_NAME, "-v", version, "--all"],
+            stderr=subprocess.DEVNULL)
+    for step in (["add"], ["build"], ["install", "--force"]):
+        if run_cmd(sudo + ["dkms", *step, "-m", MODULE_NAME, "-v", version]) != 0:
+            err(f"dkms {step[0]} failed")
+            return 1
+    run_cmd(sudo + ["depmod", "-a"])
+
+    helper = src / "cpuid-fault-emulation-helper"
+    service = src / SERVICE_NAME
+    rules = src / "10-cpuid-fault-emulation.rules"
+    if helper.is_file() and service.is_file():
+        run_cmd(sudo + ["install", "-Dm755", str(helper),
+                        f"/usr/lib/cpuid-fault-emulation/{helper.name}"])
+        run_cmd(sudo + ["install", "-Dm644", str(service),
+                        f"/etc/systemd/system/{SERVICE_NAME}"])
+        if rules.is_file():
+            run_cmd(sudo + ["install", "-Dm644", str(rules),
+                            f"/etc/polkit-1/rules.d/{rules.name}"])
+        run_cmd(sudo + ["systemctl", "daemon-reload"])
+        ok("DKMS module and systemd service installed")
+    else:
+        ok("DKMS module installed")
+
+    if which("mokutil"):
+        out = subprocess.run(["mokutil", "--sb-state"], capture_output=True,
+                             text=True, check=False).stdout.lower()
+        if "enabled" in out:
+            warn("Secure Boot is on; the module must be signed to load")
+    return 0
+
+
+def cmd_build_legion(args) -> int:
+    src = Path(args.src).expanduser() if args.src else Path.home() / "legion-kvm"
+    engine = which("podman") or which("docker")
+    if not engine:
+        err("Neither podman nor docker found.")
+        info("On Arch: sudo pacman -S --needed podman")
+        return 1
+    if not which("git"):
+        die("git is missing")
+
+    info(f"Container engine: {engine}")
+    warn("The first build takes hours and needs about 25 GiB of disk space.")
+    if not confirm("Continue?", default=False, assume_yes=args.yes):
+        return 1
+
+    if not (src / ".git").is_dir():
+        src.parent.mkdir(parents=True, exist_ok=True)
+        if run_cmd(["git", "clone", LEGION_REPO, str(src)]) != 0:
+            return 1
+    else:
+        run_cmd(["git", "-C", str(src), "pull", "--ff-only"])
+
+    jobs = str(args.jobs or max(1, (os.cpu_count() or 2) // 2))
+    if run_cmd([sys.executable, "tools/build.py", "--jobs", jobs], cwd=src) != 0:
+        err("Build failed")
+        return 1
+
+    built = src / "build/dist/legion"
+    if not built.is_file():
+        die(f"Expected binary missing: {built}")
+    ensure_dirs()
+    target = DATA_DIR / "legion"
+    shutil.copy2(built, target)
+    target.chmod(0o755)
+    settings = load_settings()
+    settings["legion_path"] = str(target)
+    save_settings(settings)
+    ok(f"Legion installed: {target}")
+    return 0
+
+
+def cmd_install_proton(args) -> int:
+    if not which("curl"):
+        die("curl is missing")
+    version = args.version or "latest"
+    variant = args.variant or "x86_64"
+
+    if version == "latest":
+        info("Resolving latest release")
+        out = subprocess.run(
+            ["curl", "-fsSIL", "-o", "/dev/null", "-w", "%{url_effective}",
+             "https://github.com/CachyOS/proton-cachyos/releases/latest"],
+            capture_output=True, text=True, check=False).stdout.strip()
+        version = out.rsplit("/", 1)[-1]
+    version = version.removeprefix("cachyos-")
+    tag = f"cachyos-{version}"
+    asset = f"proton-cachyos-{version}-{variant}"
+    base = f"https://github.com/CachyOS/proton-cachyos/releases/download/{tag}"
+
+    roots = steam_roots()
+    dest = (roots[0] if roots else Path.home() / ".local/share/Steam") / "compatibilitytools.d"
+    target = dest / asset
+    if target.is_dir() and not args.force:
+        ok(f"Already installed: {target}")
+        return 0
+
+    dest.mkdir(parents=True, exist_ok=True)
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        tarball = Path(tmp) / f"{asset}.tar.xz"
+        info(f"Downloading {asset}.tar.xz (about 350 MB)")
+        if run_cmd(["curl", "-fL", "--retry", "3", "--progress-bar",
+                    "-o", str(tarball), f"{base}/{asset}.tar.xz"]) != 0:
+            return 1
+        sums = Path(tmp) / "sha512"
+        if run_cmd(["curl", "-fsSL", "-o", str(sums), f"{base}/{asset}.sha512sum"],
+                   stderr=subprocess.DEVNULL) == 0:
+            info("Verifying checksum")
+            if run_cmd(["sha512sum", "-c", sums.name], cwd=tmp) != 0:
+                die("Checksum mismatch")
+        else:
+            warn("No checksum published; skipping verification")
+        if args.force and target.is_dir():
+            shutil.rmtree(target, ignore_errors=True)
+        info("Extracting")
+        if run_cmd(["tar", "-xf", str(tarball), "-C", str(dest)]) != 0:
+            return 1
+
+    if not (target / "proton").is_file():
+        die("Installation failed; proton script missing")
+    ok(f"Installed: {target}")
+    info("Restart Steam so it picks up the new compatibility tool")
+    return 0
+
+
+# --- GUI: GTK4 -------------------------------------------------------------
+
+
+def run_gtk_gui() -> bool:
+    try:
+        import gi
+        gi.require_version("Gtk", "4.0")
+        from gi.repository import Gtk, Gio, GLib  # noqa: F401
+    except Exception:
+        return False
+
+    class Window(Gtk.ApplicationWindow):
+        def __init__(self, app):
+            super().__init__(application=app, title=APP_NAME)
+            self.set_default_size(780, 560)
+
+            header = Gtk.HeaderBar()
+            self.set_titlebar(header)
+            for label, tip, handler in (
+                ("Add game", "Pick a Windows .exe", self.on_add),
+                ("Scan", "Search your disk for games", self.on_scan),
+            ):
+                btn = Gtk.Button(label=label)
+                btn.set_tooltip_text(tip)
+                btn.connect("clicked", handler)
+                header.pack_start(btn)
+            status_btn = Gtk.Button(label="Status")
+            status_btn.connect("clicked", self.on_status)
+            header.pack_end(status_btn)
+
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            for side in ("top", "bottom", "start", "end"):
+                getattr(box, f"set_margin_{side}")(8)
+
+            self.listbox = Gtk.ListBox()
+            self.listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
+            self.listbox.connect("row-activated", self.on_row_activated)
+            scrolled = Gtk.ScrolledWindow()
+            scrolled.set_vexpand(True)
+            scrolled.set_child(self.listbox)
+            box.append(scrolled)
+
+            toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            for label, handler in (("Play", self.on_play),
+                                   ("Runtime", self.on_runtime),
+                                   ("Desktop entry", self.on_shortcut),
+                                   ("Remove", self.on_remove)):
+                btn = Gtk.Button(label=label)
+                btn.connect("clicked", handler)
+                toolbar.append(btn)
+            self.status = Gtk.Label(xalign=1.0)
+            self.status.set_hexpand(True)
+            toolbar.append(self.status)
+            box.append(toolbar)
+
+            self.set_child(box)
+            self.reload()
+
+        def reload(self):
+            child = self.listbox.get_first_child()
+            while child is not None:
+                nxt = child.get_next_sibling()
+                self.listbox.remove(child)
+                child = nxt
+            settings = load_settings()
+            for game in load_games():
+                row = Gtk.ListBoxRow()
+                vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+                for side in ("top", "bottom", "start", "end"):
+                    getattr(vbox, f"set_margin_{side}")(6)
+                title = Gtk.Label(xalign=0)
+                title.set_markup(f"<b>{GLib.markup_escape_text(game['name'])}</b>")
+                runtime = resolve_runtime(game, settings)
+                missing = "" if Path(game["exe"]).is_file() else "  (file missing)"
+                sub = Gtk.Label(xalign=0)
+                sub.set_markup(
+                    f"<small>{GLib.markup_escape_text(runtime)} · "
+                    f"{GLib.markup_escape_text(game['exe'])}{missing}</small>")
+                vbox.append(title)
+                vbox.append(sub)
+                row.set_child(vbox)
+                row.game_id = game["id"]
+                self.listbox.append(row)
+            self.status.set_text(f"{len(load_games())} game(s)")
+
+        def selected(self):
+            row = self.listbox.get_selected_row()
+            if row is None:
+                self.status.set_text("No game selected")
+                return None
+            return find_game(load_games(), row.game_id)
+
+        def launch(self, game):
+            self.status.set_text(f"Starting {game['name']} …")
+            try:
+                launch_game(game, load_settings(), detach=True, assume_yes=True)
+                self.status.set_text(f"{game['name']} started")
+            except SystemExit as exc:
+                self.status.set_text(f"Error: {exc}")
+
+        def on_row_activated(self, _lb, row):
+            game = find_game(load_games(), row.game_id)
+            if game:
+                self.launch(game)
+
+        def on_play(self, _b):
+            game = self.selected()
+            if game:
+                self.launch(game)
+
+        def on_runtime(self, _b):
+            game = self.selected()
+            if not game:
+                return
+            order = list(RUNTIMES)
+            current = game.get("runtime", "auto")
+            nxt = order[(order.index(current) + 1) % len(order)] if current in order else "auto"
+            games = load_games()
+            for g in games:
+                if g["id"] == game["id"]:
+                    g["runtime"] = nxt
+            save_games(games)
+            self.reload()
+            self.status.set_text(f"{game['name']}: runtime = {nxt}")
+
+        def on_shortcut(self, _b):
+            game = self.selected()
+            if game:
+                self.status.set_text(f"Desktop entry: {write_shortcut(game).name}")
+
+        def on_remove(self, _b):
+            game = self.selected()
+            if not game:
+                return
+            save_games([g for g in load_games() if g["id"] != game["id"]])
+            remove_shortcut(game["id"])
+            self.reload()
+            self.status.set_text(f"{game['name']} removed")
+
+        def on_add(self, _b):
+            def handle(path: str):
+                if path:
+                    add_game(Path(path))
+                    self.reload()
+
+            try:
+                dialog = Gtk.FileDialog()
+                dialog.set_title("Select a game (.exe)")
+
+                def done(dlg, res):
+                    try:
+                        file = dlg.open_finish(res)
+                        handle(file.get_path() if file else "")
+                    except Exception:
+                        pass
+
+                dialog.open(self, None, done)
+            except AttributeError:
+                chooser = Gtk.FileChooserNative(title="Select a game (.exe)",
+                                                transient_for=self,
+                                                action=Gtk.FileChooserAction.OPEN)
+
+                def response(dlg, resp):
+                    if resp == Gtk.ResponseType.ACCEPT:
+                        handle(dlg.get_file().get_path())
+                    dlg.destroy()
+
+                chooser.connect("response", response)
+                chooser.show()
+
+        def on_scan(self, _b):
+            self.status.set_text("Scanning …")
+            found = scan_exes()
+            if not found:
+                self.status.set_text("Nothing new found")
+                return
+            win = Gtk.Window(title="Games found", transient_for=self, modal=True)
+            win.set_default_size(700, 440)
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            for side in ("top", "bottom", "start", "end"):
+                getattr(box, f"set_margin_{side}")(8)
+            listbox = Gtk.ListBox()
+            listbox.set_selection_mode(Gtk.SelectionMode.NONE)
+            checks = []
+            for path in found:
+                check = Gtk.CheckButton(label=f"{path.stem}  —  {path}")
+                checks.append((check, path))
+                listbox.append(check)
+            scrolled = Gtk.ScrolledWindow()
+            scrolled.set_vexpand(True)
+            scrolled.set_child(listbox)
+            box.append(scrolled)
+            btn = Gtk.Button(label="Add selected")
+
+            def confirm_add(_x):
+                for check, path in checks:
+                    if check.get_active():
+                        add_game(path)
+                self.reload()
+                win.destroy()
+
+            btn.connect("clicked", confirm_add)
+            box.append(btn)
+            win.set_child(box)
+            win.present()
+
+        def on_status(self, _b):
+            rows, summary = doctor_report()
+            text = "\n".join(f"{s.upper():<5} {t:<9} {d}" for s, t, d in rows)
+            win = Gtk.Window(title="Status", transient_for=self, modal=True)
+            win.set_default_size(660, 400)
+            label = Gtk.Label(label=f"{text}\n\n{summary}")
+            label.set_selectable(True)
+            label.set_xalign(0)
+            for side in ("top", "bottom", "start", "end"):
+                getattr(label, f"set_margin_{side}")(12)
+            scrolled = Gtk.ScrolledWindow()
+            scrolled.set_child(label)
+            win.set_child(scrolled)
+            win.present()
+
+    class App(Gtk.Application):
+        def __init__(self):
+            super().__init__(application_id="org.baran.Baran",
+                             flags=Gio.ApplicationFlags.NON_UNIQUE)
+
+        def do_activate(self):
+            Window(self).present()
+
+    App().run([])
+    return True
+
+
+# --- GUI: zenity fallback --------------------------------------------------
+
+
+def run_zenity_gui() -> bool:
+    zenity = which("zenity")
+    if not zenity:
+        return False
+    while True:
+        games = load_games()
+        settings = load_settings()
+        rows: list[str] = []
+        for game in games:
+            rows += [game["id"], game["name"], resolve_runtime(game, settings)]
+        rows += ["+", "Add a game …", ""]
+        rows += ["?", "Status", ""]
+
+        proc = subprocess.run(
+            [zenity, "--list", "--title", APP_NAME, "--width", "640", "--height", "460",
+             "--text", "Pick a game to start:", "--column", "ID", "--column", "Game",
+             "--column", "Runtime", "--hide-column", "1", "--print-column", "1", *rows],
+            capture_output=True, text=True, check=False)
+        if proc.returncode != 0:
+            return True
+        choice = proc.stdout.strip().split("|")[0]
+
+        if choice == "+":
+            pick = subprocess.run(
+                [zenity, "--file-selection", "--title", "Select a game (.exe)",
+                 "--file-filter", "Windows programs | *.exe *.EXE"],
+                capture_output=True, text=True, check=False)
+            if pick.returncode == 0 and pick.stdout.strip():
+                add_game(Path(pick.stdout.strip()))
+        elif choice == "?":
+            rows_txt, summary = doctor_report()
+            text = "\n".join(f"{s.upper():<5} {t:<9} {d}" for s, t, d in rows_txt)
+            subprocess.run([zenity, "--info", "--title", "Status", "--width", "640",
+                            "--text", f"{text}\n\n{summary}"], check=False)
+        else:
+            game = find_game(games, choice)
+            if game:
+                launch_game(game, settings, detach=True, assume_yes=True)
+
+
+def cmd_gui(_args) -> int:
+    ensure_dirs()
+    write_app_shortcut()
+    if os.environ.get("BARAN_GUI") != "zenity" and run_gtk_gui():
+        return 0
+    if run_zenity_gui():
+        return 0
+    warn("No GUI available (needs GTK4 or zenity); falling back to the list")
+    return cmd_list(None)
+
+
+# --- CLI -------------------------------------------------------------------
+
+
+def cmd_add(args) -> int:
+    add_game(Path(args.exe), name=args.name or "", runtime=args.runtime,
+             args=args.game_args or [], shortcut=not args.no_shortcut)
+    return 0
+
+
+def cmd_list(_args) -> int:
+    games = load_games()
+    if not games:
+        info("No games yet. Add one with: baran add /path/to/game.exe")
+        return 0
+    settings = load_settings()
+    width = max(len(g["name"]) for g in games)
+    for game in games:
+        mark = " " if Path(game["exe"]).is_file() else "!"
+        print(f"{mark} {game['id']:<22} {game['name']:<{width}}  "
+              f"{resolve_runtime(game, settings):<8} {game['exe']}")
+    return 0
+
+
+def cmd_run(args) -> int:
+    games = load_games()
+    game = find_game(games, args.game)
+    if game is None:
+        die(f"No such game: {args.game} (see 'baran list')")
+    if args.runtime:
+        game = dict(game, runtime=args.runtime)
+    return launch_game(game, load_settings(), detach=args.detach,
+                       print_only=args.print, assume_yes=args.yes,
+                       keep_module=args.keep)
+
+
+def cmd_remove(args) -> int:
+    games = load_games()
+    game = find_game(games, args.game)
+    if game is None:
+        die(f"No such game: {args.game}")
+    save_games([g for g in games if g["id"] != game["id"]])
+    remove_shortcut(game["id"])
+    if args.purge:
+        prefix = Path(game.get("prefix", ""))
+        if prefix.is_dir() and PREFIX_DIR in prefix.parents:
+            shutil.rmtree(prefix, ignore_errors=True)
+            info(f"Removed prefix: {prefix}")
+    ok(f"Removed: {game['name']}")
+    return 0
+
+
+def cmd_shortcut(args) -> int:
+    games = load_games()
+    targets = games
+    if args.game:
+        game = find_game(games, args.game)
+        if game is None:
+            die(f"No such game: {args.game}")
+        targets = [game]
+    write_app_shortcut()
+    for game in targets:
+        ok(f"{game['name']}: {write_shortcut(game)}")
+    if not targets:
+        info("No games yet; created the Baran entry only")
+    return 0
+
+
+def cmd_scan(args) -> int:
+    found = scan_exes(extra_dirs=[Path(d).expanduser() for d in (args.dir or [])])
+    if not found:
+        info("Nothing new found")
+        return 0
+    for index, path in enumerate(found, 1):
+        print(f"{index:>3}. {path}")
+    if not args.add:
+        info(f"{len(found)} candidate(s). Add them all with: baran scan --add")
+        return 0
+    for path in found:
+        add_game(path)
+    return 0
+
+
+def cmd_prepare(args) -> int:
+    ready, _ = prepare_cpuid(load_settings(), assume_yes=args.yes)
+    return 0 if ready else 1
+
+
+def cmd_unprepare(args) -> int:
+    return 0 if unprepare_cpuid(force=args.force) else 1
+
+
+def cmd_settings(args) -> int:
+    settings = load_settings()
+    if args.key is None:
+        for key, value in sorted(settings.items()):
+            print(f"{key:<20} {value}")
+        print(f"\nFile: {SETTINGS_FILE}")
+        return 0
+    if args.key not in DEFAULT_SETTINGS:
+        die(f"Unknown setting: {args.key} (see 'baran settings')")
+    if args.value is None:
+        print(settings.get(args.key, ""))
+        return 0
+    default = DEFAULT_SETTINGS[args.key]
+    value: object = args.value
+    if isinstance(default, bool):
+        value = args.value.lower() in ("1", "true", "yes", "on")
+    elif isinstance(default, int):
+        try:
+            value = int(args.value)
+        except ValueError:
+            die(f"{args.key} expects a number")
+    settings[args.key] = value
+    save_settings(settings)
+    ok(f"{args.key} = {value}")
+    return 0
+
+
+def build_parser():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog=APP,
+        description=f"{APP_NAME} - run Windows games on Linux. Double-click and go.",
+        epilog="Without a command the graphical interface opens.")
+    parser.add_argument("--version", action="version", version=f"{APP_NAME} {VERSION}")
+    sub = parser.add_subparsers(dest="command")
+
+    p = sub.add_parser("gui", help="open the graphical interface")
+    p.set_defaults(func=cmd_gui)
+
+    p = sub.add_parser("add", help="add a game")
+    p.add_argument("exe")
+    p.add_argument("--name")
+    p.add_argument("--runtime", choices=RUNTIMES, default="auto")
+    p.add_argument("--no-shortcut", action="store_true")
+    p.add_argument("game_args", nargs="*")
+    p.set_defaults(func=cmd_add)
+
+    p = sub.add_parser("list", help="list games")
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("run", help="start a game")
+    p.add_argument("game")
+    p.add_argument("--runtime", choices=RUNTIMES)
+    p.add_argument("--print", action="store_true", help="only show the command")
+    p.add_argument("--detach", action="store_true", help="start in the background")
+    p.add_argument("--keep", action="store_true", help="keep the CPUID module loaded")
+    p.add_argument("--yes", "-y", action="store_true", help="skip confirmations")
+    p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("remove", help="remove a game")
+    p.add_argument("game")
+    p.add_argument("--purge", action="store_true", help="also delete its prefix")
+    p.set_defaults(func=cmd_remove)
+
+    p = sub.add_parser("shortcut", help="create desktop entries")
+    p.add_argument("game", nargs="?")
+    p.set_defaults(func=cmd_shortcut)
+
+    p = sub.add_parser("scan", help="search the disk for games")
+    p.add_argument("--add", action="store_true")
+    p.add_argument("--dir", action="append")
+    p.set_defaults(func=cmd_scan)
+
+    p = sub.add_parser("doctor", help="check the environment")
+    p.set_defaults(func=cmd_doctor)
+
+    p = sub.add_parser("umip", help="how to disable UMIP")
+    p.set_defaults(func=cmd_umip)
+
+    p = sub.add_parser("prepare", help="load the CPUID module (unloads KVM)")
+    p.add_argument("--yes", "-y", action="store_true")
+    p.set_defaults(func=cmd_prepare)
+
+    p = sub.add_parser("unprepare", help="unload the module, restore KVM")
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(func=cmd_unprepare)
+
+    p = sub.add_parser("build-linuwux", help="build and install LinUwUx")
+    p.add_argument("--ref", help="branch, tag, commit or prNN (default pr58)")
+    p.add_argument("--src")
+    p.set_defaults(func=cmd_build_linuwux)
+
+    p = sub.add_parser("build-module", help="build the CPUID fault emulation module")
+    p.add_argument("--dkms", action="store_true", help="install via DKMS plus systemd service")
+    p.add_argument("--ref")
+    p.add_argument("--src")
+    p.add_argument("--jobs", type=int)
+    p.set_defaults(func=cmd_build_module)
+
+    p = sub.add_parser("build-legion", help="build Legion-KVM (long, needs podman)")
+    p.add_argument("--src")
+    p.add_argument("--jobs", type=int)
+    p.add_argument("--yes", "-y", action="store_true")
+    p.set_defaults(func=cmd_build_legion)
+
+    p = sub.add_parser("install-proton", help="install Proton-CachyOS")
+    p.add_argument("--version")
+    p.add_argument("--variant", default="x86_64")
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(func=cmd_install_proton)
+
+    p = sub.add_parser("settings", help="show or change settings")
+    p.add_argument("key", nargs="?")
+    p.add_argument("value", nargs="?")
+    p.set_defaults(func=cmd_settings)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(sys.argv[1:] if argv is None else argv)
+    ensure_dirs()
+    if not getattr(args, "func", None):
+        return cmd_gui(args)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        print()
+        raise SystemExit(130)
