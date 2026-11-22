@@ -2259,6 +2259,53 @@ def cmd_run(args) -> int:
                        keep_module=args.keep)
 
 
+def cmd_set(args) -> int:
+    games = load_games()
+    game = find_game(games, args.game)
+    if game is None:
+        die(f"No such game: {args.game}")
+    key, value = args.key, args.value
+
+    if key.startswith("env."):
+        name = key[4:]
+        if not name:
+            die("Use env.NAME to set a variable")
+        env = dict(game.get("env") or {})
+        if value:
+            env[name] = value
+        else:
+            env.pop(name, None)
+        game["env"] = env
+    elif key == "runtime":
+        if value not in RUNTIMES:
+            die(f"runtime must be one of: {', '.join(RUNTIMES)}")
+        game["runtime"] = value
+    elif key == "args":
+        game["args"] = value.split()
+    elif key in ("name", "proton", "prefix"):
+        if key in ("proton", "prefix") and value:
+            value = str(Path(value).expanduser())
+        game[key] = value
+    else:
+        die("key must be name, runtime, proton, prefix, args or env.NAME")
+
+    for index, existing in enumerate(games):
+        if existing["id"] == game["id"]:
+            games[index] = game
+    save_games(games)
+    ok(f"{game['id']}: {key} = {value or '(cleared)'}")
+
+    if key == "proton" and value:
+        recorded = proton_from_prefix(Path(game.get("prefix", "")))
+        chosen = Path(value)
+        if chosen.is_dir():
+            chosen = chosen / "proton"
+        if recorded and recorded != chosen:
+            warn(f"The prefix was built with {recorded.parent.name}; switching rebuilds "
+                 f"its shader cache on the next start.")
+    return 0
+
+
 def cmd_remove(args) -> int:
     games = load_games()
     game = find_game(games, args.game)
@@ -2378,6 +2425,12 @@ def build_parser():
     p.add_argument("--keep", action="store_true", help="keep the CPUID module loaded")
     p.add_argument("--yes", "-y", action="store_true", help="skip confirmations")
     p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("set", help="change a setting of one game")
+    p.add_argument("game")
+    p.add_argument("key", help="name, runtime, proton, prefix, args or env.NAME")
+    p.add_argument("value", nargs="?", default="")
+    p.set_defaults(func=cmd_set)
 
     p = sub.add_parser("remove", help="remove a game")
     p.add_argument("game")
