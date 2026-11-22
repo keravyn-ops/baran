@@ -27,7 +27,10 @@ baran run my-game --runtime linuxux   # once
 baran add game.exe --runtime legion   # permanently
 ```
 
-In the GUI, the **Runtime** button cycles through the modes for the selected game.
+In the GUI the **Runtime** button cycles through the modes for the selected game,
+**Edit** opens name, arguments, prefix, Proton and environment variables, and
+**Setup** installs or builds the optional pieces without touching a terminal
+yourself.
 
 ## Quick start
 

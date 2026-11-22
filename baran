@@ -1427,6 +1427,35 @@ def cmd_install_proton(args) -> int:
 # --- GUI: GTK4 -------------------------------------------------------------
 
 
+def terminal_command(argv: list[str]) -> list[str] | None:
+    """Wrap a command so it runs in a visible terminal window."""
+    for term, flags in (("konsole", ["--hold", "-e"]),
+                        ("gnome-terminal", ["--"]),
+                        ("xfce4-terminal", ["--hold", "-x"]),
+                        ("kitty", ["--hold"]),
+                        ("alacritty", ["--hold", "-e"]),
+                        ("xterm", ["-hold", "-e"])):
+        if which(term):
+            return [term, *flags, *argv]
+    return None
+
+
+SETUP_ACTIONS = [
+    ("Install dependencies", ["install-deps"],
+     "git, base-devel, Rust, DKMS and the kernel headers for your kernel"),
+    ("Disable UMIP", ["umip"],
+     "Shows what to add to your bootloader; needed for the linuwux runtime"),
+    ("Build LinUwUx", ["build-linuwux"],
+     "Builds and installs the preload library (a few minutes)"),
+    ("Build CPUID module", ["build-module", "--dkms"],
+     "Only on AMD before Zen 4; DKMS keeps it alive across kernel updates"),
+    ("Install Proton-CachyOS", ["install-proton"],
+     "Downloads the latest build (about 350 MB)"),
+    ("Build Legion", ["build-legion"],
+     "KVM runtime; needs podman, ~25 GiB and several hours"),
+]
+
+
 def run_gtk_gui() -> bool:
     try:
         import gi
@@ -1453,6 +1482,10 @@ def run_gtk_gui() -> bool:
             status_btn = Gtk.Button(label="Status")
             status_btn.connect("clicked", self.on_status)
             header.pack_end(status_btn)
+            setup_btn = Gtk.Button(label="Setup")
+            setup_btn.set_tooltip_text("Install and build the pieces Baran can use")
+            setup_btn.connect("clicked", self.on_setup)
+            header.pack_end(setup_btn)
 
             box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
             for side in ("top", "bottom", "start", "end"):
@@ -1468,6 +1501,7 @@ def run_gtk_gui() -> bool:
 
             toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
             for label, handler in (("Play", self.on_play),
+                                   ("Edit", self.on_edit),
                                    ("Runtime", self.on_runtime),
                                    ("Desktop entry", self.on_shortcut),
                                    ("Remove", self.on_remove)):
@@ -1630,6 +1664,128 @@ def run_gtk_gui() -> bool:
             win.set_child(box)
             win.present()
 
+        def run_in_terminal(self, cmd_args: list[str]):
+            argv = [str(SELF), *cmd_args]
+            wrapped = terminal_command(argv)
+            if wrapped is None:
+                self.status.set_text("No terminal emulator found; run in a shell: "
+                                     + " ".join(cmd_args))
+                return
+            subprocess.Popen(wrapped, start_new_session=True)
+            self.status.set_text("Running " + " ".join(cmd_args) + " in a terminal")
+
+        def on_setup(self, _b):
+            win = Gtk.Window(title="Setup", transient_for=self, modal=True)
+            win.set_default_size(620, 460)
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+            for side in ("top", "bottom", "start", "end"):
+                getattr(box, f"set_margin_{side}")(12)
+
+            intro = Gtk.Label(xalign=0, wrap=True)
+            intro.set_markup(
+                "<b>Only what you need.</b> Plain Proton works out of the box. "
+                "Each step opens a terminal so you can see what happens and type "
+                "your password when asked.")
+            box.append(intro)
+
+            for label, cmd_args, description in SETUP_ACTIONS:
+                row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+                text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+                text.set_hexpand(True)
+                title = Gtk.Label(xalign=0)
+                title.set_markup(f"<b>{GLib.markup_escape_text(label)}</b>")
+                sub = Gtk.Label(xalign=0, wrap=True)
+                sub.set_markup(f"<small>{GLib.markup_escape_text(description)}</small>")
+                text.append(title)
+                text.append(sub)
+                row.append(text)
+                btn = Gtk.Button(label="Run")
+                btn.set_valign(Gtk.Align.CENTER)
+                btn.connect("clicked",
+                            lambda _b, a=cmd_args: (self.run_in_terminal(a), win.destroy()))
+                row.append(btn)
+                box.append(row)
+
+            scrolled = Gtk.ScrolledWindow()
+            scrolled.set_vexpand(True)
+            scrolled.set_child(box)
+            win.set_child(scrolled)
+            win.present()
+            return win
+
+        def on_edit(self, _b):
+            game = self.selected()
+            if not game:
+                return
+            win = Gtk.Window(title=f"Settings – {game['name']}",
+                             transient_for=self, modal=True)
+            win.set_default_size(620, 400)
+            grid = Gtk.Grid(row_spacing=8, column_spacing=10)
+            for side in ("top", "bottom", "start", "end"):
+                getattr(grid, f"set_margin_{side}")(12)
+
+            entries: dict[str, Gtk.Entry] = {}
+            fields = [
+                ("name", "Name", game.get("name", "")),
+                ("args", "Arguments", " ".join(game.get("args", []))),
+                ("prefix", "Wine prefix", game.get("prefix", "")),
+                ("proton", "Proton (empty = from prefix)", game.get("proton", "")),
+                ("env", "Extra env (KEY=VALUE, space separated)",
+                 " ".join(f"{k}={v}" for k, v in (game.get("env") or {}).items())),
+            ]
+            runtime_values = list(RUNTIMES)
+            dropdown = Gtk.DropDown.new_from_strings(runtime_values)
+            current = game.get("runtime", "auto")
+            dropdown.set_selected(runtime_values.index(current)
+                                  if current in runtime_values else 0)
+            grid.attach(Gtk.Label(label="Runtime", xalign=0), 0, 0, 1, 1)
+            grid.attach(dropdown, 1, 0, 1, 1)
+            dropdown.set_hexpand(True)
+
+            for index, (key, label, value) in enumerate(fields, start=1):
+                grid.attach(Gtk.Label(label=label, xalign=0), 0, index, 1, 1)
+                entry = Gtk.Entry()
+                entry.set_text(value)
+                entry.set_hexpand(True)
+                grid.attach(entry, 1, index, 1, 1)
+                entries[key] = entry
+
+            hint = Gtk.Label(xalign=0, wrap=True)
+            hint.set_markup(
+                "<small>The prefix is where Windows lives for this game. Point it at an "
+                "existing Steam compatdata folder to reuse its shader cache and installed "
+                "runtimes.</small>")
+            grid.attach(hint, 0, len(fields) + 1, 2, 1)
+
+            save = Gtk.Button(label="Save")
+
+            def do_save(_x):
+                games = load_games()
+                for g in games:
+                    if g["id"] != game["id"]:
+                        continue
+                    g["name"] = entries["name"].get_text().strip() or g["name"]
+                    g["args"] = entries["args"].get_text().split()
+                    g["prefix"] = entries["prefix"].get_text().strip()
+                    g["proton"] = entries["proton"].get_text().strip()
+                    g["runtime"] = runtime_values[dropdown.get_selected()]
+                    env: dict[str, str] = {}
+                    for item in entries["env"].get_text().split():
+                        if "=" in item:
+                            k, v = item.split("=", 1)
+                            env[k] = v
+                    g["env"] = env
+                save_games(games)
+                self.reload()
+                self.status.set_text(f"Saved {game['name']}")
+                win.destroy()
+
+            save.connect("clicked", do_save)
+            grid.attach(save, 1, len(fields) + 2, 1, 1)
+            win.set_child(grid)
+            win.present()
+            return win
+
         def on_status(self, _b):
             rows, summary = doctor_report()
             text = "\n".join(f"{s.upper():<5} {t:<9} {d}" for s, t, d in rows)
@@ -1651,7 +1807,25 @@ def run_gtk_gui() -> bool:
                              flags=Gio.ApplicationFlags.NON_UNIQUE)
 
         def do_activate(self):
-            Window(self).present()
+            window = Window(self)
+            window.present()
+            if os.environ.get("BARAN_GUI_SELFTEST"):
+                # Build every dialog once, then quit: catches GTK API mistakes.
+                def check():
+                    rows = window.listbox.get_first_child()
+                    if rows is not None:
+                        window.listbox.select_row(rows)
+                    for name, builder in (("setup", window.on_setup),
+                                          ("edit", window.on_edit),
+                                          ("status", window.on_status)):
+                        child = builder(None)
+                        print(f"selftest: {name} ok")
+                        if child is not None:
+                            child.destroy()
+                    self.quit()
+                    return False
+
+                GLib.timeout_add(300, check)
 
     App().run([])
     return True
@@ -1671,6 +1845,7 @@ def run_zenity_gui() -> bool:
         for game in games:
             rows += [game["id"], game["name"], resolve_runtime(game, settings)]
         rows += ["+", "Add a game …", ""]
+        rows += ["#", "Setup …", ""]
         rows += ["?", "Status", ""]
 
         proc = subprocess.run(
@@ -1689,6 +1864,26 @@ def run_zenity_gui() -> bool:
                 capture_output=True, text=True, check=False)
             if pick.returncode == 0 and pick.stdout.strip():
                 add_game(Path(pick.stdout.strip()))
+        elif choice == "#":
+            items: list[str] = []
+            for index, (label, _cmd, description) in enumerate(SETUP_ACTIONS):
+                items += [str(index), label, description]
+            pick = subprocess.run(
+                [zenity, "--list", "--title", "Setup", "--width", "700", "--height", "420",
+                 "--text", "What should Baran set up?", "--column", "N", "--column", "Step",
+                 "--column", "What it does", "--hide-column", "1", "--print-column", "1",
+                 *items],
+                capture_output=True, text=True, check=False)
+            if pick.returncode == 0 and pick.stdout.strip():
+                cmd_args = SETUP_ACTIONS[int(pick.stdout.strip().split("|")[0])][1]
+                argv = [str(SELF), *cmd_args]
+                wrapped = terminal_command(argv)
+                if wrapped:
+                    subprocess.Popen(wrapped, start_new_session=True)
+                else:
+                    subprocess.run([zenity, "--info", "--width", "520", "--text",
+                                    "No terminal found. Run this in a shell:\n\n"
+                                    + " ".join(argv)], check=False)
         elif choice == "?":
             rows_txt, summary = doctor_report()
             text = "\n".join(f"{s.upper():<5} {t:<9} {d}" for s, t, d in rows_txt)
