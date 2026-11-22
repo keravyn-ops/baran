@@ -645,6 +645,7 @@ def make_game(exe: Path, name: str = "", runtime: str = "auto",
         "prefix": str(Path(prefix).expanduser()) if prefix else str(PREFIX_DIR / gid),
         "proton": str(Path(proton).expanduser()) if proton else "",
         "runtime": runtime,
+        "wrapper": "",
         "env": {},
         "icon": "",
         "added": datetime.now().isoformat(timespec="seconds"),
@@ -733,6 +734,10 @@ def build_command(game: dict, settings: dict) -> tuple[list[str], dict[str, str]
                 argv = [detail, "run", "--proton", str(proton_script.parent),
                         "--prefix", str(prefix), "--", str(exe), *game.get("args", [])]
             env.update({k: str(v) for k, v in (game.get("env") or {}).items()})
+            wrapper = (game.get("wrapper") or "").strip()
+            if wrapper:
+                import shlex
+                argv = shlex.split(wrapper) + argv
             return argv, env, "legion"
 
     if runtime == "linuwux":
@@ -747,6 +752,13 @@ def build_command(game: dict, settings: dict) -> tuple[list[str], dict[str, str]
             env.setdefault(key, value)
 
     env.update({k: str(v) for k, v in (game.get("env") or {}).items()})
+
+    # A wrapper goes in front of everything: gamescope, gamemoderun, mangohud.
+    wrapper = (game.get("wrapper") or "").strip()
+    if wrapper:
+        import shlex
+        base = shlex.split(wrapper) + base
+
     return base, env, runtime
 
 
@@ -2330,12 +2342,12 @@ def cmd_set(args) -> int:
         game["runtime"] = value
     elif key == "args":
         game["args"] = value.split()
-    elif key in ("name", "proton", "prefix"):
+    elif key in ("name", "proton", "prefix", "wrapper"):
         if key in ("proton", "prefix") and value:
             value = str(Path(value).expanduser())
         game[key] = value
     else:
-        die("key must be name, runtime, proton, prefix, args or env.NAME")
+        die("key must be name, runtime, proton, prefix, wrapper, args or env.NAME")
 
     for index, existing in enumerate(games):
         if existing["id"] == game["id"]:
@@ -2476,7 +2488,7 @@ def build_parser():
 
     p = sub.add_parser("set", help="change a setting of one game")
     p.add_argument("game")
-    p.add_argument("key", help="name, runtime, proton, prefix, args or env.NAME")
+    p.add_argument("key", help="name, runtime, proton, prefix, wrapper, args or env.NAME")
     p.add_argument("value", nargs="?", default="")
     p.set_defaults(func=cmd_set)
 
