@@ -699,9 +699,18 @@ def build_command(game: dict, settings: dict) -> tuple[list[str], dict[str, str]
             die("No Proton found. Install Proton or umu-run, see 'baran doctor'.")
         client = steam_roots()[0] if steam_roots() else (DATA_DIR / "steam-compat")
         Path(client).mkdir(parents=True, exist_ok=True)
-        base = [str(proton_script), "run", str(exe), *game.get("args", [])]
+        # 'waitforexitandrun' is the verb Steam uses. protonfixes and the
+        # upscaler setup (FSR4, OptiScaler) check for it and skip everything
+        # when a game is started with plain 'run'.
+        base = [str(proton_script), "waitforexitandrun", str(exe), *game.get("args", [])]
         env["STEAM_COMPAT_DATA_PATH"] = str(prefix)
         env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = str(client)
+        appid = (game.get("env") or {}).get("STEAM_APPID", "")
+        if appid:
+            # protonfixes looks these up to find game specific fixes.
+            env.setdefault("SteamAppId", appid)
+            env.setdefault("SteamGameId", appid)
+            env.setdefault("STEAM_COMPAT_APP_ID", appid)
 
     if runtime == "legion":
         usable, detail = legion_usable(settings)
