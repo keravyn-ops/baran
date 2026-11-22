@@ -625,7 +625,8 @@ def unprepare_cpuid(force: bool = False) -> bool:
 
 
 def make_game(exe: Path, name: str = "", runtime: str = "auto",
-              args: list[str] | None = None, games: list[dict] | None = None) -> dict:
+              args: list[str] | None = None, games: list[dict] | None = None,
+              prefix: str = "", proton: str = "") -> dict:
     games = games if games is not None else load_games()
     exe = exe.expanduser().resolve()
     display = name or exe.stem
@@ -635,8 +636,8 @@ def make_game(exe: Path, name: str = "", runtime: str = "auto",
         "name": display,
         "exe": str(exe),
         "args": args or [],
-        "prefix": str(PREFIX_DIR / gid),
-        "proton": "",
+        "prefix": str(Path(prefix).expanduser()) if prefix else str(PREFIX_DIR / gid),
+        "proton": str(Path(proton).expanduser()) if proton else "",
         "runtime": runtime,
         "env": {},
         "icon": "",
@@ -919,7 +920,8 @@ SCAN_DIRS = [
 
 
 def add_game(exe: Path, name: str = "", runtime: str = "auto",
-             args: list[str] | None = None, shortcut: bool = True) -> dict:
+             args: list[str] | None = None, shortcut: bool = True,
+             prefix: str = "", proton: str = "", env: dict[str, str] | None = None) -> dict:
     exe = exe.expanduser().resolve()
     if not exe.is_file():
         die(f"File not found: {exe}")
@@ -932,7 +934,14 @@ def add_game(exe: Path, name: str = "", runtime: str = "auto",
             warn(f"Already present: {g['name']} ({g['id']})")
             return g
 
-    game = make_game(exe, name=name, runtime=runtime, args=args, games=games)
+    game = make_game(exe, name=name, runtime=runtime, args=args, games=games,
+                     prefix=prefix, proton=proton)
+    if env:
+        game["env"] = env
+    if prefix:
+        recorded = proton_from_prefix(Path(prefix).expanduser())
+        if recorded:
+            info(f"Reusing existing prefix, built with {recorded.parent.name}")
     icon = extract_icon(exe, game["id"])
     if icon:
         game["icon"] = icon
@@ -1637,8 +1646,15 @@ def cmd_gui(_args) -> int:
 
 
 def cmd_add(args) -> int:
+    env: dict[str, str] = {}
+    for item in args.env or []:
+        if "=" not in item:
+            die(f"--env expects KEY=VALUE, got: {item}")
+        key, value = item.split("=", 1)
+        env[key] = value
     add_game(Path(args.exe), name=args.name or "", runtime=args.runtime,
-             args=args.game_args or [], shortcut=not args.no_shortcut)
+             args=args.game_args or [], shortcut=not args.no_shortcut,
+             prefix=args.prefix or "", proton=args.proton or "", env=env)
     return 0
 
 
@@ -1768,6 +1784,10 @@ def build_parser():
     p.add_argument("exe")
     p.add_argument("--name")
     p.add_argument("--runtime", choices=RUNTIMES, default="auto")
+    p.add_argument("--prefix", help="reuse an existing Wine prefix or compatdata folder")
+    p.add_argument("--proton", help="pin a Proton build for this game")
+    p.add_argument("--env", action="append", metavar="KEY=VALUE",
+                   help="extra environment variable, repeatable")
     p.add_argument("--no-shortcut", action="store_true")
     p.add_argument("game_args", nargs="*")
     p.set_defaults(func=cmd_add)
