@@ -68,6 +68,7 @@ Legion has no prebuilt binaries, so it must be built once. Needs rootless
 Podman or Docker, about 25 GiB of disk and a few hours:
 
 ```sh
+baran install-deps --legion   # podman
 baran build-legion
 ```
 
@@ -78,8 +79,9 @@ Vulkan driver. Baran sizes the VM from your host RAM; override with
 ### linuwux — CPUID faulting for anti-tamper titles
 
 ```sh
-baran umip            # UMIP must be off: add clearcpuid=514, reboot
-baran build-linuwux   # builds LinUwUx (needs git, Rust >= 1.98, base-devel)
+baran install-deps          # git, base-devel, Rust, DKMS, kernel headers
+baran umip                  # UMIP must be off: add clearcpuid=514, reboot
+baran build-linuwux         # builds LinUwUx
 baran build-module --dkms   # only on AMD before Zen 4
 ```
 
@@ -103,6 +105,7 @@ gen and AMD Zen 4 onwards have native CPUID faulting and need no kernel module.
 | `scan` | Search the disk for games (`--add`) |
 | `shortcut [id]` | (Re)create desktop entries |
 | `doctor` | Check the environment |
+| `install-deps` | Install build dependencies (Arch/CachyOS) |
 | `umip` | How to disable UMIP on your bootloader |
 | `prepare` / `unprepare` | Load / unload the CPUID module by hand |
 | `build-linuwux` | Build and install LinUwUx (`--ref pr58`) |

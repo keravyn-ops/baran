@@ -1058,16 +1058,33 @@ def doctor_report(settings: dict | None = None) -> tuple[list[tuple[str, str, st
     else:
         rows.append(("warn", "Games", "none yet; use 'baran add' or the GUI"))
 
+    if needs_cpuid_module() and not module_loaded() and not service_available():
+        if not (Path("/lib/modules") / kernel_release() / "build/Makefile").is_file():
+            rows.append(("warn", "Headers",
+                         f"kernel headers missing for {kernel_release()} "
+                         f"(baran install-deps --module)"))
+
     for game in games:
         prefix = Path(game.get("prefix", ""))
-        recorded = proton_from_prefix(prefix) if prefix.is_dir() else None
-        if not recorded:
+        if not prefix.is_dir():
             continue
-        chosen = pick_proton(game.get("proton") or settings.get("default_proton", ""), prefix=prefix)
-        if chosen and chosen != recorded:
-            rows.append(("warn", "Prefix",
-                         f"{game['id']}: belongs to {recorded.parent.name}, "
-                         f"would run {chosen.parent.name} (shader cache resets)"))
+        recorded = proton_from_prefix(prefix)
+        if recorded:
+            chosen = pick_proton(game.get("proton") or settings.get("default_proton", ""),
+                                 prefix=prefix)
+            if chosen and chosen != recorded:
+                rows.append(("warn", "Prefix",
+                             f"{game['id']}: belongs to {recorded.parent.name}, "
+                             f"would run {chosen.parent.name} (shader cache resets)"))
+        if resolve_runtime(game, settings) == "linuwux":
+            log = prefix / "pfx/winetricks.log"
+            installed = log.is_file() and "vcrun2022" in log.read_text(
+                encoding="utf-8", errors="replace")
+            if (prefix / "pfx").is_dir() and not installed:
+                rows.append(("warn", "Runtime libs",
+                             f"{game['id']}: vcrun2022 not found in the prefix; "
+                             f"if the game refuses to start: protontricks-launch or "
+                             f"winetricks -q vcrun2022"))
 
     counts = {"ok": 0, "warn": 0, "err": 0}
     for state, _, _ in rows:
@@ -1257,6 +1274,58 @@ def _install_dkms(src: Path) -> int:
                              text=True, check=False).stdout.lower()
         if "enabled" in out:
             warn("Secure Boot is on; the module must be signed to load")
+    return 0
+
+
+def kernel_headers_package() -> str:
+    """Best guess at the -headers package for the running kernel."""
+    vmlinuz = Path("/usr/lib/modules") / kernel_release() / "vmlinuz"
+    if which("pacman") and vmlinuz.exists():
+        out = subprocess.run(["pacman", "-Qqo", str(vmlinuz)],
+                             capture_output=True, text=True, check=False).stdout.strip()
+        if out:
+            return f"{out.splitlines()[-1]}-headers"
+    rel = kernel_release()
+    for flavour in ("cachyos", "zen", "lts", "hardened", "rt"):
+        if flavour in rel:
+            return f"linux-{flavour}-headers"
+    return "linux-headers"
+
+
+def cmd_install_deps(args) -> int:
+    if not which("pacman"):
+        err("This only knows pacman (Arch, CachyOS).")
+        info("Install the equivalents of: git base-devel rust dkms kernel-headers")
+        return 1
+
+    pkgs = ["git", "base-devel"]
+    want_all = not (args.linuwux or args.module or args.legion)
+    if want_all or args.linuwux:
+        pkgs.append("rust")
+    if want_all or args.module:
+        pkgs += ["dkms", kernel_headers_package()]
+    if args.legion:
+        pkgs.append("podman")
+
+    info(f"Installing: {' '.join(pkgs)}")
+    if not confirm("Continue?", default=True, assume_yes=args.yes):
+        return 1
+    cmd = sudo_prefix() + ["pacman", "-S", "--needed"]
+    if args.yes:
+        cmd.append("--noconfirm")
+    if run_cmd(cmd + pkgs) != 0:
+        err("pacman failed. If packages were not found, update first: sudo pacman -Syu")
+        return 1
+
+    if which("rustc"):
+        version = subprocess.run(["rustc", "--version"], capture_output=True,
+                                 text=True, check=False).stdout.split()
+        if len(version) > 1:
+            parts = [int(n) for n in re.findall(r"\d+", version[1])[:2]] or [0, 0]
+            if (parts[0], parts[1]) < (1, 98):
+                warn(f"Rust {version[1]} is older than 1.98; LinUwUx needs 1.98+")
+                info("Install rustup: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh")
+    ok("Dependencies installed")
     return 0
 
 
@@ -1831,6 +1900,13 @@ def build_parser():
     p = sub.add_parser("unprepare", help="unload the module, restore KVM")
     p.add_argument("--force", action="store_true")
     p.set_defaults(func=cmd_unprepare)
+
+    p = sub.add_parser("install-deps", help="install build dependencies (Arch/CachyOS)")
+    p.add_argument("--linuwux", action="store_true", help="only what LinUwUx needs")
+    p.add_argument("--module", action="store_true", help="only what the kernel module needs")
+    p.add_argument("--legion", action="store_true", help="also podman for building Legion")
+    p.add_argument("--yes", "-y", action="store_true")
+    p.set_defaults(func=cmd_install_deps)
 
     p = sub.add_parser("build-linuwux", help="build and install LinUwUx")
     p.add_argument("--ref", help="branch, tag, commit or prNN (default pr58)")
