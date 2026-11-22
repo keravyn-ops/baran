@@ -35,6 +35,7 @@ yourself.
 ## Quick start
 
 ```sh
+baran setup               # guided, step by step, each one verified
 baran gui                 # window with your game list
 baran add "/path/Game.exe"
 baran scan --add          # or let it find games on your disk
@@ -63,7 +64,9 @@ Nothing else is required for the `proton` runtime.
 
 ## Setting up the extra runtimes
 
-Only needed if you want them.
+Only needed if you want them. `baran setup --runtime linuwux` (or `legion`)
+walks you through it and refuses to go on while something is missing; the
+**Setup** button in the GUI does the same with a progress list.
 
 ### legion — keep KVM, run the game in a VM
 
@@ -107,6 +110,7 @@ gen and AMD Zen 4 onwards have native CPUID faulting and need no kernel module.
 | `remove <id>` | Remove a game (`--purge` also deletes its prefix) |
 | `scan` | Search the disk for games (`--add`) |
 | `shortcut [id]` | (Re)create desktop entries |
+| `setup` | Guided setup; a step unlocks only once the one before it passes |
 | `doctor` | Check the environment |
 | `install-deps` | Install build dependencies (Arch/CachyOS) |
 | `umip` | How to disable UMIP on your bootloader |

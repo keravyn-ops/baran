@@ -94,11 +94,16 @@ def ok(msg: str) -> None:
 
 
 def warn(msg: str) -> None:
+    sys.stdout.flush()
     print(f"{_c('33', '[!]')} {msg}")
 
 
 def err(msg: str) -> None:
+    # Flush first: stdout is block-buffered when piped, stderr is not, and
+    # without this the lines arrive out of order.
+    sys.stdout.flush()
     print(f"{_c('31', '[x]')} {msg}", file=sys.stderr)
+    sys.stderr.flush()
 
 
 def die(msg: str, code: int = 1):
@@ -177,6 +182,7 @@ def which(name: str) -> str | None:
 
 
 def run_cmd(argv: list[str], **kwargs) -> int:
+    sys.stdout.flush()  # keep our output ahead of the child's
     return subprocess.run(argv, **kwargs).returncode
 
 
@@ -1277,6 +1283,196 @@ def _install_dkms(src: Path) -> int:
     return 0
 
 
+# --- Guided setup ----------------------------------------------------------
+
+
+def setup_plan(target: str, settings: dict | None = None) -> list[dict]:
+    """Ordered steps for a runtime. Each step verifies itself.
+
+    A step is only offered once every step before it passes, so a half-done
+    setup cannot be mistaken for a working one.
+    """
+    settings = settings or load_settings()
+
+    def check_proton():
+        if list_protons():
+            best = pick_proton(settings.get("default_proton", ""))
+            return True, f"found {best.parent.name}" if best else (True, "found")
+        if which("umu-run"):
+            return True, "umu-run will fetch one on first launch"
+        return False, "no Proton and no umu-run"
+
+    def check_umip():
+        return (not umip_enabled(),
+                "disabled" if not umip_enabled() else "still enabled, reboot required")
+
+    def check_build_tools():
+        missing = [t for t in ("git", "cargo", "cc") if not which(t)]
+        return (not missing, "ready" if not missing else f"missing: {', '.join(missing)}")
+
+    def check_linuwux():
+        lib = find_linuwux(settings)
+        return (lib is not None, str(lib) if lib else "LinUwUx.so not installed")
+
+    def check_cpuid():
+        if cpuid_faulting_native():
+            return True, "CPU has native CPUID faulting, no module needed"
+        if not needs_cpuid_module():
+            return False, f"no native faulting and CPU is {cpu_vendor()}"
+        if module_loaded():
+            return True, "module loaded"
+        if service_available():
+            return True, "systemd service installed"
+        ko = find_module_ko(settings)
+        if ko and module_vermagic(ko) == kernel_release():
+            return True, f"module built for {kernel_release()}"
+        if ko:
+            return False, f"module built for {module_vermagic(ko)}, kernel is {kernel_release()}"
+        return False, "module not built"
+
+    def check_kvm():
+        if kvm_available():
+            return True, "/dev/kvm usable"
+        if Path("/dev/kvm").exists():
+            return False, "/dev/kvm exists but you lack permission (group 'kvm')"
+        return False, "/dev/kvm missing (enable virtualization in firmware)"
+
+    def check_engine():
+        engine = which("podman") or which("docker")
+        return (engine is not None, engine or "neither podman nor docker")
+
+    def check_legion():
+        binary = find_legion(settings)
+        return (binary is not None, str(binary) if binary else "not built yet")
+
+    def check_games():
+        games = load_games()
+        return (bool(games), f"{len(games)} game(s)" if games else "none added yet")
+
+    steps: list[dict] = [{
+        "key": "proton", "title": "Proton available",
+        "why": "Every runtime needs a Proton build to run Windows code.",
+        "check": check_proton, "fix": ["install-proton"],
+    }]
+
+    if target == "linuwux":
+        steps += [
+            {"key": "umip", "title": "UMIP disabled",
+             "why": "LinUwUx cannot work while UMIP is on. Needs a bootloader change "
+                    "and a reboot, so Baran shows you what to add instead of editing it.",
+             "check": check_umip, "fix": ["umip"], "manual": True, "reboot": True},
+            {"key": "tools", "title": "Build tools",
+             "why": "git, Rust and a C compiler are needed to build LinUwUx.",
+             "check": check_build_tools, "fix": ["install-deps"]},
+            {"key": "linuwux", "title": "LinUwUx built",
+             "why": "The preload library that fakes the CPU profile.",
+             "check": check_linuwux, "fix": ["build-linuwux"]},
+            {"key": "cpuid", "title": "CPUID faulting",
+             "why": "AMD before Zen 4 needs the emulation module; newer CPUs do not.",
+             "check": check_cpuid, "fix": ["build-module", "--dkms"]},
+        ]
+    elif target == "legion":
+        steps += [
+            {"key": "kvm", "title": "KVM accessible",
+             "why": "Legion runs the game in a virtual machine.",
+             "check": check_kvm, "fix": None, "manual": True},
+            {"key": "engine", "title": "Container engine",
+             "why": "Legion is built inside a container.",
+             "check": check_engine, "fix": ["install-deps", "--legion"]},
+            {"key": "legion", "title": "Legion built",
+             "why": "No prebuilt binaries exist; ~25 GiB and several hours.",
+             "check": check_legion, "fix": ["build-legion"]},
+        ]
+
+    steps.append({
+        "key": "games", "title": "At least one game",
+        "why": "Add a Windows .exe so there is something to launch.",
+        "check": check_games, "fix": None, "manual": True,
+        "hint": 'baran add "/path/Game.exe"   or   baran scan --add',
+    })
+    return steps
+
+
+def evaluate_plan(steps: list[dict]) -> list[dict]:
+    """Annotate steps with state: done, current (first unfinished) or locked."""
+    result = []
+    seen_unfinished = False
+    for step in steps:
+        passed, detail = step["check"]()
+        if passed:
+            state = "done"
+        elif not seen_unfinished:
+            state = "current"
+            seen_unfinished = True
+        else:
+            state = "locked"
+        result.append({**step, "state": state, "detail": detail, "passed": passed})
+    return result
+
+
+def cmd_setup(args) -> int:
+    target = args.runtime
+    if not target:
+        if not sys.stdin.isatty():
+            die("Pick a runtime: baran setup --runtime proton|linuwux|legion")
+        print("What do you want to set up?\n")
+        print("  1) proton   normal games, works almost everywhere")
+        print("  2) linuwux  titles whose anti-tamper needs CPUID faulting")
+        print("  3) legion   run games in a KVM virtual machine\n")
+        choice = input("Choice [1]: ").strip() or "1"
+        target = {"1": "proton", "2": "linuwux", "3": "legion"}.get(choice)
+        if not target:
+            die("Not a valid choice")
+
+    while True:
+        steps = evaluate_plan(setup_plan(target, load_settings()))
+        print(f"\nSetup for the {target} runtime\n")
+        for index, step in enumerate(steps, 1):
+            mark = {"done": _c("32", "[done]"),
+                    "current": _c("33", "[next]"),
+                    "locked": "[    ]"}[step["state"]]
+            print(f" {mark} {index}. {step['title']:<22} {step['detail']}")
+
+        current = next((s for s in steps if s["state"] == "current"), None)
+        if current is None:
+            print()
+            ok(f"Everything for the {target} runtime is in place.")
+            games = load_games()
+            if games:
+                info(f"Start it with: baran run {games[0]['id']}   (or: baran gui)")
+            return 0
+
+        print(f"\n{_c('1', 'Next:')} {current['title']}")
+        print(f"  {current['why']}")
+        if current.get("hint"):
+            print(f"  {current['hint']}")
+
+        if current.get("fix") is None:
+            err("This step needs you; Baran will not continue until it passes.")
+            return 1
+
+        if current.get("manual"):
+            print()
+            run_cmd([str(SELF), *current["fix"]])
+            if current.get("reboot"):
+                warn("Reboot, then run 'baran setup' again to continue.")
+            return 1
+
+        if not confirm(f"Run '{' '.join(current['fix'])}' now?", default=True,
+                       assume_yes=args.yes):
+            info("Stopped. Nothing after this step is unlocked.")
+            return 1
+
+        rc = run_cmd([str(SELF), *current["fix"]])
+        passed, detail = current["check"]()
+        if rc != 0 or not passed:
+            print()
+            err(f"Step '{current['title']}' did not pass: {detail}")
+            err("Fix this before continuing; later steps stay locked.")
+            return 1
+        ok(f"{current['title']}: {detail}")
+
+
 def kernel_headers_package() -> str:
     """Best guess at the -headers package for the running kernel."""
     vmlinuz = Path("/usr/lib/modules") / kernel_release() / "vmlinuz"
@@ -1544,11 +1740,14 @@ def run_gtk_gui() -> bool:
             self.status.set_text(f"{len(load_games())} game(s)")
 
         def selected(self):
-            row = self.listbox.get_selected_row()
-            if row is None:
+            game = self.selected_quiet()
+            if game is None:
                 self.status.set_text("No game selected")
-                return None
-            return find_game(load_games(), row.game_id)
+            return game
+
+        def selected_quiet(self):
+            row = self.listbox.get_selected_row()
+            return find_game(load_games(), row.game_id) if row is not None else None
 
         def launch(self, game):
             self.status.set_text(f"Starting {game['name']} …")
@@ -1676,40 +1875,111 @@ def run_gtk_gui() -> bool:
 
         def on_setup(self, _b):
             win = Gtk.Window(title="Setup", transient_for=self, modal=True)
-            win.set_default_size(620, 460)
-            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+            win.set_default_size(700, 560)
+            outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
             for side in ("top", "bottom", "start", "end"):
-                getattr(box, f"set_margin_{side}")(12)
+                getattr(outer, f"set_margin_{side}")(12)
+
+            targets = ["proton", "linuwux", "legion"]
+            picker_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            picker_row.append(Gtk.Label(label="Set up for runtime:", xalign=0))
+            picker = Gtk.DropDown.new_from_strings(targets)
+            game = self.selected_quiet()
+            current_runtime = resolve_runtime(game, load_settings()) if game else "proton"
+            picker.set_selected(targets.index(current_runtime)
+                                if current_runtime in targets else 0)
+            picker_row.append(picker)
+            recheck = Gtk.Button(label="Check again")
+            recheck.set_hexpand(True)
+            recheck.set_halign(Gtk.Align.END)
+            picker_row.append(recheck)
+            outer.append(picker_row)
 
             intro = Gtk.Label(xalign=0, wrap=True)
             intro.set_markup(
-                "<b>Only what you need.</b> Plain Proton works out of the box. "
-                "Each step opens a terminal so you can see what happens and type "
-                "your password when asked.")
-            box.append(intro)
+                "<small>Steps run in order. A step unlocks only once everything above it "
+                "passes, and each one is re-checked afterwards. Runs open a terminal so "
+                "you can watch and type your password.</small>")
+            outer.append(intro)
 
-            for label, cmd_args, description in SETUP_ACTIONS:
-                row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-                text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-                text.set_hexpand(True)
-                title = Gtk.Label(xalign=0)
-                title.set_markup(f"<b>{GLib.markup_escape_text(label)}</b>")
-                sub = Gtk.Label(xalign=0, wrap=True)
-                sub.set_markup(f"<small>{GLib.markup_escape_text(description)}</small>")
-                text.append(title)
-                text.append(sub)
-                row.append(text)
-                btn = Gtk.Button(label="Run")
-                btn.set_valign(Gtk.Align.CENTER)
-                btn.connect("clicked",
-                            lambda _b, a=cmd_args: (self.run_in_terminal(a), win.destroy()))
-                row.append(btn)
-                box.append(row)
-
+            steps_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
             scrolled = Gtk.ScrolledWindow()
             scrolled.set_vexpand(True)
-            scrolled.set_child(box)
-            win.set_child(scrolled)
+            scrolled.set_child(steps_box)
+            outer.append(scrolled)
+
+            summary = Gtk.Label(xalign=0, wrap=True)
+            outer.append(summary)
+
+            def render(*_a):
+                child = steps_box.get_first_child()
+                while child is not None:
+                    nxt = child.get_next_sibling()
+                    steps_box.remove(child)
+                    child = nxt
+
+                target = targets[picker.get_selected()]
+                steps = evaluate_plan(setup_plan(target, load_settings()))
+                for index, step in enumerate(steps, 1):
+                    row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+                    symbol = {"done": "✓", "current": "▶", "locked": "·"}[step["state"]]
+                    marker = Gtk.Label(label=symbol)
+                    marker.set_valign(Gtk.Align.START)
+                    row.append(marker)
+
+                    text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+                    text.set_hexpand(True)
+                    title = Gtk.Label(xalign=0, wrap=True)
+                    title.set_markup(
+                        f"<b>{index}. {GLib.markup_escape_text(step['title'])}</b>  "
+                        f"<small>{GLib.markup_escape_text(step['detail'])}</small>")
+                    why = Gtk.Label(xalign=0, wrap=True)
+                    why.set_markup(f"<small>{GLib.markup_escape_text(step['why'])}</small>")
+                    text.append(title)
+                    text.append(why)
+                    if step.get("hint") and step["state"] == "current":
+                        hint = Gtk.Label(xalign=0, wrap=True, selectable=True)
+                        hint.set_markup(f"<small><tt>"
+                                        f"{GLib.markup_escape_text(step['hint'])}</tt></small>")
+                        text.append(hint)
+                    row.append(text)
+
+                    if step["state"] == "done":
+                        badge = Gtk.Label(label="done")
+                        badge.set_valign(Gtk.Align.CENTER)
+                        row.append(badge)
+                    elif step.get("fix"):
+                        btn = Gtk.Button(label="Run")
+                        btn.set_valign(Gtk.Align.CENTER)
+                        btn.set_sensitive(step["state"] == "current")
+                        btn.connect("clicked",
+                                    lambda _b, a=step["fix"]: self.run_in_terminal(a))
+                        row.append(btn)
+                    else:
+                        note = Gtk.Label(label="your turn")
+                        note.set_valign(Gtk.Align.CENTER)
+                        note.set_sensitive(step["state"] == "current")
+                        row.append(note)
+
+                    row.set_sensitive(step["state"] != "locked")
+                    steps_box.append(row)
+
+                done = sum(1 for s in steps if s["state"] == "done")
+                if done == len(steps):
+                    summary.set_markup(
+                        f"<b>Ready.</b> Everything for the {target} runtime is in place.")
+                else:
+                    nxt = next(s for s in steps if s["state"] == "current")
+                    summary.set_markup(
+                        f"<b>{done} of {len(steps)} done.</b> Next: "
+                        f"{GLib.markup_escape_text(nxt['title'])}. After running a step, "
+                        f"press <i>Check again</i>.")
+
+            picker.connect("notify::selected", render)
+            recheck.connect("clicked", render)
+            render()
+
+            win.set_child(outer)
             win.present()
             return win
 
@@ -2095,6 +2365,11 @@ def build_parser():
     p = sub.add_parser("unprepare", help="unload the module, restore KVM")
     p.add_argument("--force", action="store_true")
     p.set_defaults(func=cmd_unprepare)
+
+    p = sub.add_parser("setup", help="guided setup; each step is verified before the next")
+    p.add_argument("--runtime", choices=("proton", "linuwux", "legion"))
+    p.add_argument("--yes", "-y", action="store_true")
+    p.set_defaults(func=cmd_setup)
 
     p = sub.add_parser("install-deps", help="install build dependencies (Arch/CachyOS)")
     p.add_argument("--linuwux", action="store_true", help="only what LinUwUx needs")
