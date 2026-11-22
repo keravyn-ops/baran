@@ -99,6 +99,85 @@ gen and AMD Zen 4 onwards have native CPUID faulting and need no kernel module.
 > it taints the kernel. Baran unloads KVM before loading it and restores KVM
 > afterwards. With `--dkms` it also survives kernel updates.
 
+## Hypervisor / ARTIFACT builds
+
+Some builds ship their own loader next to the executable: `artifact.dll`,
+`coldloader.dll`, a `steam_settings/` folder, `Artifact_AMD` / `Artifact_Intel`.
+Baran recognises those when you add the game, selects the `linuwux` runtime and
+takes `STEAM_APPID` from the build. The notes below cost a long evening to find.
+
+### Proton must be called the way Steam calls it
+
+ProtonFixes only runs when Proton is invoked with the `waitforexitandrun` verb:
+
+```python
+def check_conditions() -> bool:
+    return (... and 'waitforexitandrun' in sys.argv[1])
+```
+
+Starting a game with plain `proton run` silently skips every game specific fix
+**and the whole FSR4 / upscaler setup**. Baran always uses `waitforexitandrun`.
+
+### Do not start these games from Steam as well
+
+Steam launches a shortcut with its own compatibility tool. That rewrites
+`compatdata/<id>/version` and `config_info`, so the prefix now belongs to a
+different Proton: the shader cache is thrown away, and on the next Baran start
+the Proton recorded in the prefix is used instead of the one you configured.
+Either launch only through Baran, or force the same build in Steam under
+**Properties → Compatibility**.
+
+### Frame generation mods break on older CPUs
+
+OptiScaler with `MFGUnlocker.asi` and RTX frame generation mods inject
+`dxgi.dll`, `winmm.dll`, `d3d12.dll` and `dbghelp.dll` into the prefix. On a
+Zen 2 CPU this produced a hundred `0xC000001D` (illegal instruction) faults per
+session and the mod terminated the game after a few seconds:
+
+```
+Session end: process exit (ExitProcess) after 7.9 s
+  exit stack: #00 MFGUnlocker.asi+0xE7F3A ... #08 PBZ.exe
+  0xC000001D (illegal instruction) at PBZ.exe+0x19BC53A0
+```
+
+A half installed OptiScaler is worse than none: ProtonFixes reported
+`Failed to validate optiscaler files` and still logged `OptiScaler enabled`.
+If a game dies seconds after the Vulkan device comes up, remove
+`<prefix>/drive_c/windows/system32/umu/` and the injected DLLs.
+
+Plain FSR4 does not need OptiScaler. `amdxcffx64.dll` is copied into the prefix
+by ProtonFixes and upgrades FSR 3.1 titles on RDNA2 and newer.
+
+### Removing injected DLLs: restore the real ones
+
+`winmm.dll` and `dbghelp.dll` are genuine Windows libraries. Delete the
+OptiScaler copies and Proton does **not** put them back; the game then starts,
+never renders and exits after about 100 seconds. Restore them from Proton's
+template and dereference the symlink, otherwise you install a dangling link:
+
+```sh
+P=.../compatibilitytools.d/<proton>/files/share/default_pfx/drive_c/windows/system32
+cp -L "$P/winmm.dll"   "<prefix>/drive_c/windows/system32/winmm.dll"
+cp -L "$P/dbghelp.dll" "<prefix>/drive_c/windows/system32/dbghelp.dll"
+```
+
+### gamescope is not automatically a win
+
+A custom Proton may ask for it (`BC250_PACE off (not under gamescope)`), but on
+the tested PS5 hardware wrapping the game in gamescope killed it after roughly
+20 seconds, while the same build ran for minutes without it. Measure both with
+`baran set <game> wrapper "gamescope -f -- "` before believing either.
+
+### Measuring instead of guessing
+
+MangoHud averages lie: a run that never leaves the menu still reports 60 FPS at
+0 % GPU load. Check GPU load and VRAM alongside the frame rate, and judge
+smoothness by the frametime maximum, not the average.
+
+On the reference PS5 (2 GB VRAM carve-out, 12.9 GB RAM) the measured path was
+47 FPS with a saturated VRAM pool and active swap, and 78 FPS once the frame
+generation mods were gone and the system had been rebooted.
+
 ## Commands
 
 | Command | Description |
